@@ -20,6 +20,7 @@ import html
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "caisse.db")
 EXPORTS_DIR = os.path.join(APP_DIR, "etats_imprimes")
+ASSETS_DIR = os.path.join(APP_DIR, "assets")
 
 CATEGORIES = [
     "Carburant / Vidange",
@@ -32,13 +33,20 @@ CATEGORIES = [
     "Autre",
 ]
 
-WALNUT = "#4a3222"
-WALNUT_DEEP = "#38251a"
-PAPER = "#f7f2e7"
-PAPER_DARK = "#efe6d3"
-BRASS = "#a97b2f"
-GREEN = "#3f6b4a"
-ROSE = "#a94438"
+# Palette de marque "Société Magasin Les Cinq Frères" (extraite du logo)
+NAVY = "#004E74"        # bleu marine — actions principales, titres
+NAVY_DEEP = "#00354F"   # bleu marine profond — en-tête, bandeau résumé
+TEAL = "#08A4B0"        # turquoise — accents sur fond sombre
+TEAL_DARK = "#067885"   # turquoise foncé — accents sur fond clair, survol
+INK = "#1F2A33"         # texte principal
+MUTED = "#5B6B79"       # texte secondaire
+BG = "#F4F6F8"          # fond général de l'application
+SURFACE = "#FFFFFF"     # fond des panneaux / tableaux
+BORDER = "#DCE3E8"      # séparateurs, bordures
+SUCCESS = "#1B8A5A"     # montant final positif
+DANGER = "#C1373B"      # montant final négatif (caisse en déficit)
+
+ASSETS_DIR = os.path.join(APP_DIR, "assets")
 
 
 def fmt(n):
@@ -168,39 +176,84 @@ def monthly_stats(year_month):
 # ---------------------------------------------------------------------------
 # Export / impression (génère une page HTML locale, ouverte dans le navigateur)
 # ---------------------------------------------------------------------------
+_LOGO_DATA_URI_CACHE = None
+
+
+def _logo_data_uri():
+    """Encode le logo en base64 pour que la fiche imprimée reste autonome
+    (lisible même si le dossier etats_imprimes/ est copié ailleurs)."""
+    global _LOGO_DATA_URI_CACHE
+    if _LOGO_DATA_URI_CACHE is None:
+        path = os.path.join(ASSETS_DIR, "logo_print.png")
+        if os.path.exists(path):
+            import base64
+            with open(path, "rb") as f:
+                _LOGO_DATA_URI_CACHE = "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+        else:
+            _LOGO_DATA_URI_CACHE = ""
+    return _LOGO_DATA_URI_CACHE
+
+
 def export_print_html(jour_date, solde_initial, recettes, expenses, total_depenses, final):
     os.makedirs(EXPORTS_DIR, exist_ok=True)
     rows = "".join(
-        f"<tr><td>{html.escape(e['motif'])} ({html.escape(e['categorie'])})</td>"
-        f"<td style='text-align:right'>{fmt(e['montant'])}</td></tr>"
+        f"<tr><td>{html.escape(e['motif'])}<span class='cat'>{html.escape(e['categorie'])}</span></td>"
+        f"<td class='amt'>{fmt(e['montant'])}</td></tr>"
         for e in expenses
     )
+    logo_uri = _logo_data_uri()
+    logo_html = f'<img src="{logo_uri}" alt="Les Cinq Frères" class="logo">' if logo_uri else ""
+    final_class = "positive" if final >= 0 else "negative"
     content = f"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
 <title>Etat de caisse {jour_date}</title>
 <style>
- body {{ font-family: 'Courier New', monospace; max-width: 480px; margin: 40px auto; color:#2c2117; }}
- h1 {{ text-align:center; margin-bottom:0; font-size:20px; }}
- p.sub {{ text-align:center; margin-top:4px; font-size:12px; }}
- table {{ width:100%; border-collapse:collapse; font-size:13px; margin-top:10px; }}
- td {{ padding:4px 0; }}
- hr {{ border:none; border-top:1px dashed #999; margin:12px 0; }}
- .final {{ font-weight:bold; font-size:16px; }}
- button {{ margin-top:20px; padding:8px 16px; }}
+ :root {{
+   --navy:#004E74; --navy-deep:#00354F; --teal:#08A4B0; --ink:#1F2A33;
+   --muted:#5B6B79; --border:#DCE3E8; --success:#1B8A5A; --danger:#C1373B; --bg:#F4F6F8;
+ }}
+ * {{ box-sizing:border-box; }}
+ body {{ font-family:'Segoe UI', Arial, sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:32px 16px; }}
+ .card {{ max-width:480px; margin:0 auto; background:#fff; border:1px solid var(--border); border-radius:10px;
+          box-shadow:0 4px 14px rgba(0,78,116,0.08); overflow:hidden; }}
+ .head {{ background:var(--navy-deep); color:#fff; padding:22px 24px; text-align:center; }}
+ .logo {{ height:56px; margin-bottom:8px; }}
+ .head h1 {{ margin:0; font-size:16px; letter-spacing:0.5px; }}
+ .head p {{ margin:4px 0 0; font-size:12px; color:var(--teal); font-weight:600; }}
+ .meta {{ text-align:center; padding:12px 24px 0; font-size:12px; color:var(--muted); }}
+ table {{ width:100%; border-collapse:collapse; font-size:13px; }}
+ .items {{ padding:8px 24px 0; }}
+ .items td {{ padding:7px 0; border-bottom:1px solid var(--border); }}
+ .items .cat {{ display:block; font-size:11px; color:var(--muted); }}
+ .amt {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }}
+ .totals {{ padding:14px 24px 22px; }}
+ .totals td {{ padding:5px 0; }}
+ .totals tr.final td {{ padding-top:12px; border-top:2px solid var(--border); font-weight:700; font-size:16px; }}
+ .totals tr.final.positive td {{ color:var(--success); }}
+ .totals tr.final.negative td {{ color:var(--danger); }}
+ .foot {{ text-align:center; padding:0 24px 22px; }}
+ button {{ background:var(--navy); color:#fff; border:none; border-radius:6px; padding:10px 22px;
+           font-size:13px; font-weight:600; cursor:pointer; }}
+ button:hover {{ background:var(--navy-deep); }}
+ @media print {{ body {{ background:#fff; padding:0; }} .card {{ box-shadow:none; border:none; }} .foot {{ display:none; }} }}
 </style></head>
 <body>
-<h1>LES CINQ FRÈRES</h1>
-<p class="sub">État de caisse — {jour_date}<br>Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}</p>
-<hr>
-<table>{rows}</table>
-<hr>
-<table>
- <tr><td>Solde initial</td><td style="text-align:right">{fmt(solde_initial)}</td></tr>
- <tr><td>Recettes</td><td style="text-align:right">+ {fmt(recettes)}</td></tr>
- <tr><td>Total dépenses</td><td style="text-align:right">- {fmt(total_depenses)}</td></tr>
- <tr class="final"><td>MONTANT FINAL</td><td style="text-align:right">{fmt(final)}</td></tr>
-</table>
-<button onclick="window.print()">Imprimer</button>
+<div class="card">
+  <div class="head">
+    {logo_html}
+    <h1>SOCIÉTÉ MAGASIN LES CINQ FRÈRES</h1>
+    <p>État de caisse</p>
+  </div>
+  <p class="meta">{jour_date} — généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}</p>
+  <table class="items">{rows}</table>
+  <table class="totals">
+   <tr><td>Solde initial</td><td class="amt">{fmt(solde_initial)}</td></tr>
+   <tr><td>Recettes</td><td class="amt">+ {fmt(recettes)}</td></tr>
+   <tr><td>Total dépenses</td><td class="amt">- {fmt(total_depenses)}</td></tr>
+   <tr class="final {final_class}"><td>MONTANT FINAL</td><td class="amt">{fmt(final)}</td></tr>
+  </table>
+  <div class="foot"><button onclick="window.print()">🖨 Imprimer</button></div>
+</div>
 </body></html>"""
     path = os.path.join(EXPORTS_DIR, f"etat_{jour_date}.html")
     with open(path, "w", encoding="utf-8") as f:
@@ -214,12 +267,13 @@ def export_print_html(jour_date, solde_initial, recettes, expenses, total_depens
 class CaisseApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Livre de Caisse — Les Cinq Frères")
-        self.geometry("880x600")
-        self.configure(bg=PAPER)
+        self.title("Société Magasin Les Cinq Frères — Livre de Caisse")
+        self.geometry("920x620")
+        self.configure(bg=BG)
         self.expenses = []  # dépenses de la journée en cours de saisie
 
         self._build_style()
+        self._load_icon_images()
         self._build_header()
 
         self.notebook = ttk.Notebook(self)
@@ -245,21 +299,77 @@ class CaisseApp(tk.Tk):
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure("Paper.TFrame", background=PAPER)
-        style.configure("TLabel", background=PAPER, foreground=WALNUT, font=("Segoe UI", 10))
-        style.configure("Header.TLabel", background=WALNUT_DEEP, foreground=PAPER, font=("Georgia", 15, "bold"))
-        style.configure("Cat.TLabel", background=PAPER, foreground=BRASS, font=("Segoe UI", 9, "bold"))
-        style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
-        style.configure("Treeview", font=("Consolas", 10), rowheight=24)
-        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
+        style.configure("Paper.TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=INK, font=("Segoe UI", 10))
+        style.configure("Header.TLabel", background=NAVY_DEEP, foreground="white", font=("Segoe UI", 15, "bold"))
+        style.configure("Cat.TLabel", background=BG, foreground=TEAL_DARK, font=("Segoe UI", 9, "bold"))
+
+        # Boutons
+        style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=(14, 8),
+                         background=SURFACE, foreground=NAVY, borderwidth=1, relief="flat")
+        style.map("TButton",
+                   background=[("active", BORDER)],
+                   bordercolor=[("!disabled", BORDER)])
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 8),
+                         background=NAVY, foreground="white", borderwidth=0, relief="flat")
+        style.map("Primary.TButton", background=[("active", NAVY_DEEP)])
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 8),
+                         background=TEAL, foreground="white", borderwidth=0, relief="flat")
+        style.map("Accent.TButton", background=[("active", TEAL_DARK)])
+
+        # Champs de saisie
+        style.configure("TEntry", fieldbackground=SURFACE, foreground=INK,
+                         bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, padding=6)
+        style.configure("TCombobox", fieldbackground=SURFACE, background=SURFACE, foreground=INK, padding=6)
+
+        # Tableaux
+        style.configure("Treeview", font=("Segoe UI", 10), rowheight=26,
+                         background=SURFACE, fieldbackground=SURFACE, foreground=INK, borderwidth=0)
+        style.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"),
+                         background=NAVY, foreground="white", relief="flat", padding=6)
+        style.map("Treeview.Heading", background=[("active", NAVY)])
+        style.map("Treeview", background=[("selected", TEAL)], foreground=[("selected", "white")])
+
+        # Onglets
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", font=("Segoe UI", 10, "bold"), background=BORDER,
+                         foreground=INK, padding=(18, 10), borderwidth=0)
+        style.map("TNotebook.Tab",
+                   background=[("selected", NAVY)],
+                   foreground=[("selected", "white")])
+
+    def _load_icon_images(self):
+        sizes = (16, 32, 48, 64, 128)
+        self._icon_imgs = []
+        for size in sizes:
+            path = os.path.join(ASSETS_DIR, f"icon_{size}.png")
+            if os.path.exists(path):
+                self._icon_imgs.append(tk.PhotoImage(file=path))
+        if self._icon_imgs:
+            self.iconphoto(True, *self._icon_imgs)
 
     def _build_header(self):
-        header = tk.Frame(self, bg=WALNUT_DEEP, height=64)
+        header = tk.Frame(self, bg=NAVY_DEEP, height=68)
         header.pack(fill="x")
-        tk.Label(header, text="📒  Livre de Caisse — Les Cinq Frères", bg=WALNUT_DEEP, fg=PAPER,
-                  font=("Georgia", 15, "bold"), padx=16, pady=16).pack(side="left")
-        tk.Label(header, text="Application locale — aucune donnée en ligne", bg=WALNUT_DEEP, fg=BRASS,
-                  font=("Segoe UI", 9), padx=16).pack(side="right")
+        header.pack_propagate(False)
+
+        left = tk.Frame(header, bg=NAVY_DEEP)
+        left.pack(side="left", padx=18, pady=10)
+
+        logo_path = os.path.join(ASSETS_DIR, "logo_header.png")
+        if os.path.exists(logo_path):
+            self._logo_img = tk.PhotoImage(file=logo_path)
+            tk.Label(left, image=self._logo_img, bg=NAVY_DEEP).pack(side="left", padx=(0, 12))
+
+        titles = tk.Frame(left, bg=NAVY_DEEP)
+        titles.pack(side="left")
+        tk.Label(titles, text="SOCIÉTÉ MAGASIN LES CINQ FRÈRES", bg=NAVY_DEEP, fg="white",
+                  font=("Segoe UI", 13, "bold")).pack(anchor="w")
+        tk.Label(titles, text="Livre de Caisse", bg=NAVY_DEEP, fg=TEAL,
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+
+        tk.Label(header, text="Application locale — aucune donnée en ligne", bg=NAVY_DEEP, fg="#A9C2CF",
+                  font=("Segoe UI", 9), padx=18).pack(side="right")
 
     # ----- Saisie du jour -------------------------------------------------
     def _build_saisie_tab(self):
@@ -302,32 +412,60 @@ class CaisseApp(tk.Tk):
 
         ttk.Button(add_frame, text="+ Ajouter", command=self._add_expense).grid(row=1, column=3)
 
-        # Liste des dépenses
-        cols = ("motif", "categorie", "montant")
-        self.tree_dep = ttk.Treeview(f, columns=cols, show="headings", height=9)
-        self.tree_dep.heading("motif", text="Motif")
-        self.tree_dep.heading("categorie", text="Catégorie")
-        self.tree_dep.heading("montant", text="Montant")
-        self.tree_dep.column("motif", width=340)
-        self.tree_dep.column("categorie", width=200)
-        self.tree_dep.column("montant", width=120, anchor="e")
-        self.tree_dep.pack(fill="both", expand=True, padx=16, pady=8)
-        self.tree_dep.bind("<Delete>", lambda e: self._remove_selected_expense())
+        # Liste des dépenses — tableau structuré : Désignation | Montant
+        self.selected_expense_idx = None
+        self._expense_row_widgets = []
+
+        card = tk.Frame(f, bg=BORDER)
+        card.pack(fill="both", expand=True, padx=16, pady=8)
+        inner = tk.Frame(card, bg=SURFACE)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        head = tk.Frame(inner, bg=BG)
+        head.pack(fill="x")
+        head.columnconfigure(0, weight=1)
+        tk.Label(head, text="DÉSIGNATION", bg=BG, fg=MUTED, font=("Segoe UI", 9, "bold"),
+                  anchor="w", padx=14, pady=9).grid(row=0, column=0, sticky="ew")
+        tk.Label(head, text="MONTANT", bg=BG, fg=MUTED, font=("Segoe UI", 9, "bold"),
+                  anchor="e", padx=14, pady=9, width=16).grid(row=0, column=1, sticky="e")
+        tk.Frame(inner, bg=BORDER, height=2).pack(fill="x")
+
+        rows_area = tk.Frame(inner, bg=SURFACE)
+        rows_area.pack(fill="both", expand=True)
+        self.dep_canvas = tk.Canvas(rows_area, bg=SURFACE, highlightthickness=0, height=230, takefocus=1)
+        vsb = ttk.Scrollbar(rows_area, orient="vertical", command=self.dep_canvas.yview)
+        self.dep_canvas.configure(yscrollcommand=vsb.set)
+        self.dep_canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.dep_rows_frame = tk.Frame(self.dep_canvas, bg=SURFACE)
+        self._dep_canvas_window = self.dep_canvas.create_window((0, 0), window=self.dep_rows_frame, anchor="nw")
+        self.dep_rows_frame.bind("<Configure>", lambda e: self.dep_canvas.configure(scrollregion=self.dep_canvas.bbox("all")))
+        self.dep_canvas.bind("<Configure>", lambda e: self.dep_canvas.itemconfig(self._dep_canvas_window, width=e.width))
+        self.dep_canvas.bind("<Button-1>", lambda e: self.dep_canvas.focus_set())
+        self.dep_canvas.bind("<Delete>", lambda e: self._remove_selected_expense())
 
         del_btn = ttk.Button(f, text="Supprimer la dépense sélectionnée", command=self._remove_selected_expense)
         del_btn.pack(anchor="w", padx=16)
 
         # Résumé
-        summary = tk.Frame(f, bg=WALNUT_DEEP)
+        summary = tk.Frame(f, bg=NAVY_DEEP)
         summary.pack(fill="x", padx=16, pady=12)
-        self.lbl_summary = tk.Label(summary, text="", bg=WALNUT_DEEP, fg=PAPER, font=("Consolas", 12),
-                                     justify="left", padx=16, pady=10)
-        self.lbl_summary.pack(anchor="w")
+        self.txt_summary = tk.Text(summary, bg=NAVY_DEEP, fg="white", font=("Consolas", 12),
+                                    relief="flat", height=5, width=44, padx=16, pady=10,
+                                    highlightthickness=0, borderwidth=0, cursor="arrow")
+        self.txt_summary.tag_configure("muted", foreground="#B9D2DB")
+        self.txt_summary.tag_configure("positive", foreground=SUCCESS, font=("Consolas", 13, "bold"))
+        self.txt_summary.tag_configure("negative", foreground="#FF8A80", font=("Consolas", 13, "bold"))
+        self.txt_summary.configure(state="disabled")
+        self.txt_summary.pack(anchor="w")
 
         actions = ttk.Frame(f, style="Paper.TFrame")
         actions.pack(fill="x", padx=16, pady=(0, 16))
-        ttk.Button(actions, text="💾 Enregistrer la journée", command=self._save_day).pack(side="left", padx=(0, 10))
-        ttk.Button(actions, text="🖨 Imprimer / Exporter", command=self._print_current).pack(side="left")
+        ttk.Button(actions, text="💾 Enregistrer la journée", style="Primary.TButton",
+                    command=self._save_day).pack(side="left", padx=(0, 10))
+        ttk.Button(actions, text="🖨 Imprimer / Exporter", style="Accent.TButton",
+                    command=self._print_current).pack(side="left")
 
     def _new_day(self, jour_date):
         self.var_date.set(jour_date)
@@ -341,7 +479,8 @@ class CaisseApp(tk.Tk):
             self.var_solde.set(str(round(prev_final, 3)) if prev_final is not None else "0")
             self.var_recettes.set("0")
             self.expenses = []
-        self._refresh_expense_tree()
+        self.selected_expense_idx = None
+        self._refresh_expense_list()
         self._refresh_summary()
 
     def _add_expense(self):
@@ -356,22 +495,71 @@ class CaisseApp(tk.Tk):
         self.expenses.append({"motif": motif, "categorie": self.var_cat.get(), "montant": montant})
         self.var_motif.set("")
         self.var_montant.set("")
-        self._refresh_expense_tree()
+        self._refresh_expense_list()
         self._refresh_summary()
+
+    def _select_expense_row(self, idx):
+        self.selected_expense_idx = idx
+        self._highlight_selected_row()
+        self.dep_canvas.focus_set()
 
     def _remove_selected_expense(self):
-        sel = self.tree_dep.selection()
-        if not sel:
+        idx = self.selected_expense_idx
+        if idx is None or idx >= len(self.expenses):
             return
-        idx = self.tree_dep.index(sel[0])
         del self.expenses[idx]
-        self._refresh_expense_tree()
+        self.selected_expense_idx = None
+        self._refresh_expense_list()
         self._refresh_summary()
 
-    def _refresh_expense_tree(self):
-        self.tree_dep.delete(*self.tree_dep.get_children())
-        for e in self.expenses:
-            self.tree_dep.insert("", "end", values=(e["motif"], e["categorie"], fmt(e["montant"])))
+    def _set_widget_bg(self, widget, color):
+        try:
+            widget.configure(bg=color)
+        except tk.TclError:
+            pass
+        for child in widget.winfo_children():
+            self._set_widget_bg(child, color)
+
+    def _highlight_selected_row(self):
+        for i, row in enumerate(self._expense_row_widgets):
+            if i == self.selected_expense_idx:
+                color = "#D3ECEE"
+            else:
+                color = SURFACE if i % 2 == 0 else BG
+            self._set_widget_bg(row, color)
+
+    def _refresh_expense_list(self):
+        for w in self.dep_rows_frame.winfo_children():
+            w.destroy()
+        self._expense_row_widgets = []
+
+        if not self.expenses:
+            tk.Label(self.dep_rows_frame, text="Aucune dépense ajoutée pour cette journée.",
+                      bg=SURFACE, fg=MUTED, font=("Segoe UI", 9, "italic"), pady=22).pack(fill="x")
+            return
+
+        for i, e in enumerate(self.expenses):
+            rowbg = SURFACE if i % 2 == 0 else BG
+            row = tk.Frame(self.dep_rows_frame, bg=rowbg, cursor="hand2")
+            row.pack(fill="x")
+            row.columnconfigure(0, weight=1)
+
+            left = tk.Frame(row, bg=rowbg)
+            left.grid(row=0, column=0, sticky="w", padx=14, pady=8)
+            tk.Label(left, text=e["motif"], bg=rowbg, fg=INK, font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(left, text=e["categorie"], bg=rowbg, fg=TEAL_DARK, font=("Segoe UI", 8, "bold"), anchor="w").pack(anchor="w")
+
+            amt = tk.Label(row, text=fmt(e["montant"]), bg=rowbg, fg=INK, font=("Consolas", 11, "bold"),
+                            anchor="e", width=16, padx=14)
+            amt.grid(row=0, column=1, sticky="e")
+
+            tk.Frame(self.dep_rows_frame, bg=BORDER, height=1).pack(fill="x")
+
+            for w in (row, left, amt, *left.winfo_children()):
+                w.bind("<Button-1>", lambda ev, idx=i: self._select_expense_row(idx))
+            self._expense_row_widgets.append(row)
+
+        self._highlight_selected_row()
 
     def _totals(self):
         try:
@@ -388,13 +576,15 @@ class CaisseApp(tk.Tk):
 
     def _refresh_summary(self):
         solde, recettes, total_dep, final = self._totals()
-        self.lbl_summary.config(text=(
-            f"Solde initial ......... {fmt(solde)}\n"
-            f"Recettes ............... + {fmt(recettes)}\n"
-            f"Total dépenses ({len(self.expenses)}) ...... - {fmt(total_dep)}\n"
-            f"{'-'*38}\n"
-            f"MONTANT FINAL CAISSE ... {fmt(final)}"
-        ))
+        self.txt_summary.configure(state="normal")
+        self.txt_summary.delete("1.0", "end")
+        self.txt_summary.insert("end", f"Solde initial ......... {fmt(solde)}\n", "muted")
+        self.txt_summary.insert("end", f"Recettes ............... + {fmt(recettes)}\n", "muted")
+        self.txt_summary.insert("end", f"Total dépenses ({len(self.expenses)}) ...... - {fmt(total_dep)}\n", "muted")
+        self.txt_summary.insert("end", f"{'-'*38}\n", "muted")
+        tag = "positive" if final >= 0 else "negative"
+        self.txt_summary.insert("end", f"MONTANT FINAL CAISSE ... {fmt(final)}", tag)
+        self.txt_summary.configure(state="disabled")
 
     def _save_day(self):
         jour_date = self.var_date.get().strip()
@@ -423,18 +613,25 @@ class CaisseApp(tk.Tk):
             self.tree_hist.column(c, width=180, anchor="center" if c != "date" else "w")
         self.tree_hist.pack(fill="both", expand=True, padx=16, pady=16)
         self.tree_hist.bind("<Double-1>", self._open_selected_day)
+        self.tree_hist.tag_configure("even", background=SURFACE)
+        self.tree_hist.tag_configure("odd", background=BG)
+        self.tree_hist.tag_configure("deficit", foreground=DANGER)
 
         btns = ttk.Frame(f, style="Paper.TFrame")
         btns.pack(fill="x", padx=16, pady=(0, 12))
         ttk.Button(btns, text="Ouvrir dans Saisie", command=self._open_selected_day).pack(side="left", padx=(0, 10))
-        ttk.Button(btns, text="🖨 Imprimer ce jour", command=self._print_selected_history).pack(side="left")
+        ttk.Button(btns, text="🖨 Imprimer ce jour", style="Accent.TButton",
+                    command=self._print_selected_history).pack(side="left")
 
     def _refresh_historique(self):
         self.tree_hist.delete(*self.tree_hist.get_children())
-        for rec in list_jours():
+        for i, rec in enumerate(list_jours()):
+            tags = ["even" if i % 2 == 0 else "odd"]
+            if rec["final"] < 0:
+                tags.append("deficit")
             self.tree_hist.insert("", "end", iid=rec["date"], values=(
                 rec["date"], fmt(rec["recettes"]), fmt(rec["total_depenses"]), fmt(rec["final"])
-            ))
+            ), tags=tags)
 
     def _open_selected_day(self, event=None):
         sel = self.tree_hist.selection()
@@ -463,27 +660,34 @@ class CaisseApp(tk.Tk):
         e = ttk.Entry(top, textvariable=self.var_month, width=10)
         e.pack(side="left")
         e.bind("<Return>", lambda ev: self._refresh_dashboard())
-        ttk.Button(top, text="Actualiser", command=self._refresh_dashboard).pack(side="left", padx=8)
+        ttk.Button(top, text="Actualiser", style="Primary.TButton",
+                    command=self._refresh_dashboard).pack(side="left", padx=8)
 
-        self.txt_dash = tk.Text(f, font=("Consolas", 11), bg=PAPER, fg=WALNUT, relief="flat",
-                                 height=26, wrap="word")
+        self.txt_dash = tk.Text(f, font=("Consolas", 11), bg=SURFACE, fg=INK, relief="flat",
+                                 height=26, wrap="word", highlightthickness=0, borderwidth=0)
+        self.txt_dash.tag_configure("title", foreground=NAVY, font=("Consolas", 12, "bold"))
+        self.txt_dash.tag_configure("muted", foreground=MUTED)
+        self.txt_dash.tag_configure("bar", foreground=TEAL_DARK)
+        self.txt_dash.tag_configure("cat", foreground=INK, font=("Consolas", 11, "bold"))
         self.txt_dash.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
     def _refresh_dashboard(self):
         stats = monthly_stats(self.var_month.get().strip())
         self.txt_dash.config(state="normal")
         self.txt_dash.delete("1.0", "end")
-        self.txt_dash.insert("end", f"RÉSUMÉ DU MOIS {self.var_month.get()}\n")
-        self.txt_dash.insert("end", "=" * 46 + "\n\n")
+        self.txt_dash.insert("end", f"RÉSUMÉ DU MOIS {self.var_month.get()}\n", "title")
+        self.txt_dash.insert("end", "=" * 46 + "\n\n", "muted")
         self.txt_dash.insert("end", f"Jours enregistrés ......... {stats['nb_jours']}\n")
         self.txt_dash.insert("end", f"Total recettes ............ {fmt(stats['total_recettes'])}\n")
         self.txt_dash.insert("end", f"Total dépenses ............ {fmt(stats['total_depenses'])}\n\n")
-        self.txt_dash.insert("end", "Dépenses par catégorie :\n")
-        self.txt_dash.insert("end", "-" * 46 + "\n")
+        self.txt_dash.insert("end", "Dépenses par catégorie :\n", "title")
+        self.txt_dash.insert("end", "-" * 46 + "\n", "muted")
         maxv = max(stats["par_categorie"].values(), default=1)
         for cat, montant in sorted(stats["par_categorie"].items(), key=lambda x: -x[1]):
             bar = "█" * max(1, int(montant / maxv * 24)) if maxv else ""
-            self.txt_dash.insert("end", f"{cat:<24} {bar}\n    {fmt(montant)}\n\n")
+            self.txt_dash.insert("end", f"{cat:<24} ", "cat")
+            self.txt_dash.insert("end", f"{bar}\n", "bar")
+            self.txt_dash.insert("end", f"    {fmt(montant)}\n\n", "muted")
         if not stats["par_categorie"]:
             self.txt_dash.insert("end", "(aucune dépense ce mois-ci)\n")
         self.txt_dash.config(state="disabled")
