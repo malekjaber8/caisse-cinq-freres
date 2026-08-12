@@ -37,14 +37,19 @@ le même dossier — c'est là que sont stockées toutes les journées enregistr
 - Catégorie dédiée **« Versement banque »** pour les dépôts en banque
 - Calcul automatique du montant final en caisse
 - Historique de toutes les journées, modifiable en double-cliquant
+- Justificatif (photo ou PDF de facture) attachable à chaque dépense, consultable
+  à tout moment même si le papier d'origine est perdu — stocké dans le dossier
+  `justificatifs/`
 - Tableau de bord mensuel : total recettes/dépenses et répartition par catégorie
 - Impression : génère une page propre et l'ouvre dans le navigateur (Ctrl+P pour
   imprimer sur papier ou enregistrer en PDF) — fonctionne aussi hors ligne
 
 ## 4. Sauvegarde
 
-Le fichier `caisse.db` contient toutes les données. Pense à en faire une copie de temps
-en temps (clé USB, dossier partagé de la société) pour ne jamais perdre l'historique.
+Le fichier `caisse.db` contient toutes les données, et le dossier `justificatifs/`
+contient les photos/PDF de factures attachées aux dépenses. Pense à sauvegarder
+**les deux ensemble** de temps en temps (clé USB, dossier partagé de la société)
+pour ne jamais perdre l'historique ni les justificatifs.
 
 ## 5. Prochaines évolutions possibles
 

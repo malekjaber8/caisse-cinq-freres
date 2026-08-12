@@ -10,9 +10,11 @@ Lancer :  python caisse_app.py
 """
 
 import os
+import shutil
 import sqlite3
+import uuid
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from datetime import date, datetime
 import webbrowser
 import html
@@ -21,6 +23,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "caisse.db")
 EXPORTS_DIR = os.path.join(APP_DIR, "etats_imprimes")
 ASSETS_DIR = os.path.join(APP_DIR, "assets")
+ATTACHMENTS_DIR = os.path.join(APP_DIR, "justificatifs")
+ATTACHMENT_FILETYPES = [("Photos et PDF", "*.jpg *.jpeg *.png *.pdf"), ("Tous les fichiers", "*.*")]
 
 CATEGORIES = [
     "Carburant / Vidange",
@@ -74,8 +78,15 @@ def init_db():
         motif TEXT NOT NULL,
         categorie TEXT NOT NULL,
         montant REAL NOT NULL,
+        piece_jointe TEXT,
         FOREIGN KEY (jour_id) REFERENCES jours(id) ON DELETE CASCADE
     )""")
+    # Migration : les bases existantes créées avant l'ajout des justificatifs
+    # n'ont pas encore la colonne piece_jointe.
+    c.execute("PRAGMA table_info(depenses)")
+    cols = [row[1] for row in c.fetchall()]
+    if "piece_jointe" not in cols:
+        c.execute("ALTER TABLE depenses ADD COLUMN piece_jointe TEXT")
     conn.commit()
     conn.close()
 
@@ -101,8 +112,8 @@ def upsert_jour(jour_date, solde_initial, recettes, expenses):
                   (jour_date, solde_initial, recettes))
         jour_id = c.lastrowid
     for e in expenses:
-        c.execute("INSERT INTO depenses (jour_id, motif, categorie, montant) VALUES (?,?,?,?)",
-                  (jour_id, e["motif"], e["categorie"], e["montant"]))
+        c.execute("INSERT INTO depenses (jour_id, motif, categorie, montant, piece_jointe) VALUES (?,?,?,?,?)",
+                  (jour_id, e["motif"], e["categorie"], e["montant"], e.get("piece_jointe")))
     conn.commit()
     conn.close()
     return jour_id
@@ -117,10 +128,31 @@ def load_jour(jour_date):
         conn.close()
         return None
     jour_id, solde_initial, recettes = row
-    c.execute("SELECT id, motif, categorie, montant FROM depenses WHERE jour_id=?", (jour_id,))
-    expenses = [{"id": r[0], "motif": r[1], "categorie": r[2], "montant": r[3]} for r in c.fetchall()]
+    c.execute("SELECT id, motif, categorie, montant, piece_jointe FROM depenses WHERE jour_id=?", (jour_id,))
+    expenses = [{"id": r[0], "motif": r[1], "categorie": r[2], "montant": r[3], "piece_jointe": r[4]}
+                for r in c.fetchall()]
     conn.close()
     return {"jour_date": jour_date, "solde_initial": solde_initial, "recettes": recettes, "expenses": expenses}
+
+
+# ---------------------------------------------------------------------------
+# Justificatifs (photos / PDF de factures) — stockés dans un dossier local,
+# seul le nom de fichier est conservé dans la base.
+# ---------------------------------------------------------------------------
+def save_attachment(source_path):
+    os.makedirs(ATTACHMENTS_DIR, exist_ok=True)
+    ext = os.path.splitext(source_path)[1].lower()
+    filename = f"{uuid.uuid4().hex}{ext}"
+    shutil.copy2(source_path, os.path.join(ATTACHMENTS_DIR, filename))
+    return filename
+
+
+def open_attachment(filename):
+    path = os.path.join(ATTACHMENTS_DIR, filename)
+    if not os.path.exists(path):
+        messagebox.showerror("Fichier introuvable", "Ce justificatif est introuvable sur le disque.")
+        return
+    os.startfile(path)
 
 
 def list_jours():
@@ -410,7 +442,16 @@ class CaisseApp(tk.Tk):
         e_montant.grid(row=1, column=2, padx=(0, 10))
         e_montant.bind("<Return>", lambda e: self._add_expense())
 
-        ttk.Button(add_frame, text="+ Ajouter", command=self._add_expense).grid(row=1, column=3)
+        ttk.Button(add_frame, text="+ Ajouter", command=self._add_expense).grid(row=1, column=3, padx=(0, 20))
+
+        ttk.Label(add_frame, text="Justificatif", style="Cat.TLabel").grid(row=0, column=4, sticky="w")
+        attach_box = ttk.Frame(add_frame, style="Paper.TFrame")
+        attach_box.grid(row=1, column=4, sticky="w")
+        self._pending_attachment = None
+        ttk.Button(attach_box, text="📎 Joindre", command=self._pick_attachment).pack(side="left")
+        self.lbl_attachment = tk.Label(attach_box, text="aucun fichier", bg=BG, fg=MUTED,
+                                        font=("Segoe UI", 8, "italic"))
+        self.lbl_attachment.pack(side="left", padx=(8, 0))
 
         # Liste des dépenses — tableau structuré : Désignation | Montant
         self.selected_expense_idx = None
@@ -426,8 +467,9 @@ class CaisseApp(tk.Tk):
         head.columnconfigure(0, weight=1)
         tk.Label(head, text="DÉSIGNATION", bg=BG, fg=MUTED, font=("Segoe UI", 9, "bold"),
                   anchor="w", padx=14, pady=9).grid(row=0, column=0, sticky="ew")
+        tk.Label(head, text="", bg=BG, width=3).grid(row=0, column=1)
         tk.Label(head, text="MONTANT", bg=BG, fg=MUTED, font=("Segoe UI", 9, "bold"),
-                  anchor="e", padx=14, pady=9, width=16).grid(row=0, column=1, sticky="e")
+                  anchor="e", padx=14, pady=9, width=16).grid(row=0, column=2, sticky="e")
         tk.Frame(inner, bg=BORDER, height=2).pack(fill="x")
 
         rows_area = tk.Frame(inner, bg=SURFACE)
@@ -480,8 +522,18 @@ class CaisseApp(tk.Tk):
             self.var_recettes.set("0")
             self.expenses = []
         self.selected_expense_idx = None
+        self._pending_attachment = None
+        self.lbl_attachment.config(text="aucun fichier", fg=MUTED)
         self._refresh_expense_list()
         self._refresh_summary()
+
+    def _pick_attachment(self):
+        path = filedialog.askopenfilename(title="Choisir un justificatif (photo ou PDF)",
+                                           filetypes=ATTACHMENT_FILETYPES)
+        if not path:
+            return
+        self._pending_attachment = save_attachment(path)
+        self.lbl_attachment.config(text=f"✓ {os.path.basename(path)}", fg=SUCCESS)
 
     def _add_expense(self):
         motif = self.var_motif.get().strip()
@@ -492,7 +544,10 @@ class CaisseApp(tk.Tk):
         if not motif or montant <= 0:
             messagebox.showwarning("Champ manquant", "Merci d'indiquer un motif et un montant valide.")
             return
-        self.expenses.append({"motif": motif, "categorie": self.var_cat.get(), "montant": montant})
+        self.expenses.append({"motif": motif, "categorie": self.var_cat.get(), "montant": montant,
+                               "piece_jointe": self._pending_attachment})
+        self._pending_attachment = None
+        self.lbl_attachment.config(text="aucun fichier", fg=MUTED)
         self.var_motif.set("")
         self.var_montant.set("")
         self._refresh_expense_list()
@@ -549,9 +604,17 @@ class CaisseApp(tk.Tk):
             tk.Label(left, text=e["motif"], bg=rowbg, fg=INK, font=("Segoe UI", 10, "bold"), anchor="w").pack(anchor="w")
             tk.Label(left, text=e["categorie"], bg=rowbg, fg=TEAL_DARK, font=("Segoe UI", 8, "bold"), anchor="w").pack(anchor="w")
 
+            has_piece = bool(e.get("piece_jointe"))
+            clip = tk.Label(row, text=("📎" if has_piece else ""), bg=rowbg, fg=TEAL_DARK,
+                              font=("Segoe UI", 11), width=3, anchor="center",
+                              cursor=("hand2" if has_piece else "arrow"))
+            clip.grid(row=0, column=1, sticky="ns")
+            if has_piece:
+                clip.bind("<Button-1>", lambda ev, fn=e["piece_jointe"]: open_attachment(fn))
+
             amt = tk.Label(row, text=fmt(e["montant"]), bg=rowbg, fg=INK, font=("Consolas", 11, "bold"),
                             anchor="e", width=16, padx=14)
-            amt.grid(row=0, column=1, sticky="e")
+            amt.grid(row=0, column=2, sticky="e")
 
             tk.Frame(self.dep_rows_frame, bg=BORDER, height=1).pack(fill="x")
 

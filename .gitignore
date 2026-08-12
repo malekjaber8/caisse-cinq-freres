@@ -2,6 +2,7 @@
 caisse.db
 caisse.db-journal
 etats_imprimes/
+justificatifs/
 
 # Python
 __pycache__/
