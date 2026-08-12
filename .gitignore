@@ -1,0 +1,13 @@
+# Données locales (ne pas versionner)
+caisse.db
+caisse.db-journal
+etats_imprimes/
+
+# Python
+__pycache__/
+*.pyc
+
+# Build PyInstaller
+build/
+dist/
+*.spec
