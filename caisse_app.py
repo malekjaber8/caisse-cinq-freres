@@ -12,6 +12,7 @@ Lancer :  python caisse_app.py
 import os
 import csv
 import hashlib
+import json
 import shutil
 import sqlite3
 import sys
@@ -34,7 +35,7 @@ BACKUP_RETENTION_DAYS = 30
 
 CATEGORIE_VERSEMENT = "Versement banque"
 
-CATEGORIES = [
+DEFAULT_CATEGORIES = [
     "Carburant / Vidange",
     "Entretien véhicule",
     "Internet / Téléphone",
@@ -138,6 +139,30 @@ def set_config(key, value):
               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
     conn.commit()
     conn.close()
+
+
+def get_categories():
+    """Liste des catégories, modifiable depuis l'appli (stockée en base).
+    CATEGORIE_VERSEMENT est toujours présente : son traitement spécial
+    (déduite de la caisse mais pas comptée comme dépense) en dépend."""
+    raw = get_config("categories")
+    if raw:
+        try:
+            cats = json.loads(raw)
+            if isinstance(cats, list) and cats:
+                if CATEGORIE_VERSEMENT not in cats:
+                    cats.append(CATEGORIE_VERSEMENT)
+                return cats
+        except (ValueError, TypeError):
+            pass
+    return list(DEFAULT_CATEGORIES)
+
+
+def set_categories(cats):
+    cats = [c.strip() for c in cats if c.strip()]
+    if CATEGORIE_VERSEMENT not in cats:
+        cats.append(CATEGORIE_VERSEMENT)
+    set_config("categories", json.dumps(cats, ensure_ascii=False))
 
 
 def _hash_secret(secret, salt=None):
@@ -1260,9 +1285,14 @@ class CaisseApp(tk.Tk):
         self.e_motif = ttk.Entry(add_frame, textvariable=self.var_motif, width=28)
         self.e_motif.grid(row=1, column=0, padx=(0, 10))
 
-        ttk.Label(add_frame, text="Catégorie", style="Cat.TLabel").grid(row=0, column=1, sticky="w")
-        self.var_cat = tk.StringVar(value=CATEGORIES[0])
-        self.cb_categorie = ttk.Combobox(add_frame, textvariable=self.var_cat, values=CATEGORIES, width=22, state="readonly")
+        cat_head = ttk.Frame(add_frame, style="Paper.TFrame")
+        cat_head.grid(row=0, column=1, sticky="ew")
+        ttk.Label(cat_head, text="Catégorie", style="Cat.TLabel").pack(side="left")
+        gear = tk.Label(cat_head, text="⚙", bg=BG, fg=TEAL_DARK, font=("Segoe UI", 9, "bold"), cursor="hand2")
+        gear.pack(side="left", padx=(6, 0))
+        gear.bind("<Button-1>", lambda e: self._manage_categories())
+        self.var_cat = tk.StringVar(value=get_categories()[0])
+        self.cb_categorie = ttk.Combobox(add_frame, textvariable=self.var_cat, values=get_categories(), width=22, state="readonly")
         self.cb_categorie.grid(row=1, column=1, padx=(0, 10))
 
         ttk.Label(add_frame, text="Montant", style="Cat.TLabel").grid(row=0, column=2, sticky="w")
@@ -1551,12 +1581,117 @@ class CaisseApp(tk.Tk):
     def _cancel_edit(self):
         self._editing_idx = None
         self.var_motif.set("")
-        self.var_cat.set(CATEGORIES[0])
+        self.var_cat.set(get_categories()[0])
         self.var_montant.set("")
         self._pending_attachment = None
         self.lbl_attachment.config(text="aucun fichier", fg=MUTED)
         self.btn_add_expense.config(text="+ Ajouter", command=self._add_expense)
         self.btn_cancel_edit.grid_remove()
+
+    def _manage_categories(self):
+        # Fenêtre sans bordure système : formule fiable retenue après le bug
+        # d'affichage rencontré avec les Toplevel décorées classiques.
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.configure(bg=BORDER)
+
+        card = tk.Frame(win, bg=SURFACE)
+        card.pack(padx=1, pady=1)
+
+        header = tk.Frame(card, bg=NAVY_DEEP)
+        header.pack(fill="x")
+        tk.Label(header, text="Gérer les catégories", bg=NAVY_DEEP, fg="white",
+                  font=("Segoe UI", 11, "bold"), padx=14, pady=10).pack(side="left")
+        close_lbl = tk.Label(header, text="✕", bg=NAVY_DEEP, fg="#A9C2CF", font=("Segoe UI", 10, "bold"),
+                               padx=12, pady=10, cursor="hand2")
+        close_lbl.pack(side="right")
+        close_lbl.bind("<Button-1>", lambda e: win.destroy())
+
+        tk.Label(card, text="Double-clique un nom pour le renommer. « Versement banque » est fixe.",
+                  bg=SURFACE, fg=MUTED, font=("Segoe UI", 9), anchor="w", padx=16, wraplength=320,
+                  justify="left").pack(fill="x", pady=(10, 6))
+
+        rows_frame = tk.Frame(card, bg=SURFACE)
+        rows_frame.pack(fill="x", padx=16)
+
+        def refresh_rows():
+            for w in rows_frame.winfo_children():
+                w.destroy()
+            for cat in get_categories():
+                row = tk.Frame(rows_frame, bg=SURFACE)
+                row.pack(fill="x", pady=2)
+                lbl = tk.Label(row, text=cat, bg=SURFACE, fg=INK, font=("Segoe UI", 10),
+                                anchor="w", cursor="hand2" if cat != CATEGORIE_VERSEMENT else "arrow")
+                lbl.pack(side="left", fill="x", expand=True)
+                if cat == CATEGORIE_VERSEMENT:
+                    tk.Label(row, text="🔒", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9)).pack(side="right")
+                else:
+                    lbl.bind("<Double-Button-1>", lambda e, c=cat: rename_cat(c))
+                    del_lbl = tk.Label(row, text="✕", bg=SURFACE, fg=DANGER, font=("Segoe UI", 9, "bold"), cursor="hand2")
+                    del_lbl.pack(side="right")
+                    del_lbl.bind("<Button-1>", lambda e, c=cat: delete_cat(c))
+
+        def rename_cat(old_name):
+            new_name = simpledialog.askstring("Renommer la catégorie", "Nouveau nom :",
+                                                initialvalue=old_name, parent=win)
+            if not new_name or not new_name.strip() or new_name.strip() == old_name:
+                return
+            cats = get_categories()
+            cats = [new_name.strip() if c == old_name else c for c in cats]
+            set_categories(cats)
+            refresh_rows()
+            self._sync_categories()
+
+        def delete_cat(name):
+            if messagebox.askyesno("Supprimer la catégorie",
+                                     f"Supprimer « {name} » ? Les dépenses déjà enregistrées avec "
+                                     "cette catégorie garderont leur nom d'origine.", parent=win):
+                cats = [c for c in get_categories() if c != name]
+                set_categories(cats)
+                refresh_rows()
+                self._sync_categories()
+
+        def add_cat():
+            name = var_new.get().strip()
+            if not name:
+                return
+            cats = get_categories()
+            if name in cats:
+                messagebox.showinfo("Déjà existante", "Cette catégorie existe déjà.", parent=win)
+                return
+            cats.append(name)
+            set_categories(cats)
+            var_new.set("")
+            refresh_rows()
+            self._sync_categories()
+
+        refresh_rows()
+
+        add_row = tk.Frame(card, bg=SURFACE)
+        add_row.pack(fill="x", padx=16, pady=(10, 16))
+        var_new = tk.StringVar()
+        e_new = ttk.Entry(add_row, textvariable=var_new, width=24)
+        e_new.pack(side="left")
+        e_new.bind("<Return>", lambda e: add_cat())
+        ttk.Button(add_row, text="+ Ajouter", style="Primary.TButton", command=add_cat).pack(side="left", padx=(8, 0))
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.transient(self)
+        win.update_idletasks()
+        w, h = win.winfo_width(), win.winfo_height()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+        win.lift()
+        win.attributes("-topmost", True)
+        win.after(300, lambda: win.attributes("-topmost", False))
+        win.focus_force()
+
+    def _sync_categories(self):
+        """Reflète la liste de catégories à jour dans le formulaire de saisie."""
+        cats = get_categories()
+        self.cb_categorie.configure(values=cats)
+        if self.var_cat.get() not in cats:
+            self.var_cat.set(cats[0])
 
     def _save_expense_edit(self):
         motif = self.var_motif.get().strip()
