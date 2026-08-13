@@ -10,12 +10,16 @@ Lancer :  python caisse_app.py
 """
 
 import os
+import csv
+import hashlib
 import shutil
 import sqlite3
+import sys
 import uuid
+import calendar as calendar_mod
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import webbrowser
 import html
 
@@ -26,16 +30,22 @@ ASSETS_DIR = os.path.join(APP_DIR, "assets")
 ATTACHMENTS_DIR = os.path.join(APP_DIR, "justificatifs")
 ATTACHMENT_FILETYPES = [("Photos et PDF", "*.jpg *.jpeg *.png *.pdf"), ("Tous les fichiers", "*.*")]
 
+CATEGORIE_VERSEMENT = "Versement banque"
+
 CATEGORIES = [
     "Carburant / Vidange",
     "Entretien véhicule",
     "Internet / Téléphone",
     "Fournitures bureau",
     "Salaires",
-    "Versement banque",
+    CATEGORIE_VERSEMENT,
     "Livraison / Transport",
     "Autre",
 ]
+
+FR_MOIS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet",
+           "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+FR_JOURS = ["Lu", "Ma", "Me", "Je", "Ve", "Sa", "Di"]
 
 # Palette de marque "Société Magasin Les Cinq Frères" (extraite du logo)
 NAVY = "#004E74"        # bleu marine — actions principales, titres
@@ -87,6 +97,10 @@ def init_db():
     cols = [row[1] for row in c.fetchall()]
     if "piece_jointe" not in cols:
         c.execute("ALTER TABLE depenses ADD COLUMN piece_jointe TEXT")
+    c.execute("""CREATE TABLE IF NOT EXISTS app_config (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
     conn.commit()
     conn.close()
 
@@ -95,6 +109,73 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+# ---------------------------------------------------------------------------
+# Configuration / protection par mot de passe
+# ---------------------------------------------------------------------------
+def get_config(key, default=None):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT value FROM app_config WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_config(key, value):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO app_config (key, value) VALUES (?, ?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    conn.commit()
+    conn.close()
+
+
+def _hash_secret(secret, salt=None):
+    if salt is None:
+        salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 100_000)
+    return salt.hex(), digest.hex()
+
+
+def _verify_secret(secret, salt_hex, hash_hex):
+    salt = bytes.fromhex(salt_hex)
+    _, digest_hex = _hash_secret(secret, salt)
+    return digest_hex == hash_hex
+
+
+def is_password_configured():
+    return get_config("password_hash") is not None
+
+
+def set_password(password, question=None, answer=None):
+    salt, h = _hash_secret(password)
+    set_config("password_salt", salt)
+    set_config("password_hash", h)
+    if question and answer:
+        asalt, ah = _hash_secret(answer.strip().lower())
+        set_config("security_question", question)
+        set_config("security_answer_salt", asalt)
+        set_config("security_answer_hash", ah)
+
+
+def check_password(password):
+    salt, h = get_config("password_salt"), get_config("password_hash")
+    if not salt or not h:
+        return False
+    return _verify_secret(password, salt, h)
+
+
+def get_security_question():
+    return get_config("security_question", "")
+
+
+def check_security_answer(answer):
+    salt, h = get_config("security_answer_salt"), get_config("security_answer_hash")
+    if not salt or not h:
+        return False
+    return _verify_secret(answer.strip().lower(), salt, h)
 
 
 def upsert_jour(jour_date, solde_initial, recettes, expenses):
@@ -155,6 +236,17 @@ def open_attachment(filename):
     os.startfile(path)
 
 
+def days_with_entries(year, month):
+    """Ensemble des dates (YYYY-MM-DD) déjà enregistrées pour ce mois — utilisé
+    pour repérer les jours saisis dans le calendrier."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT jour_date FROM jours WHERE jour_date LIKE ?", (f"{year:04d}-{month:02d}-%",))
+    result = {r[0] for r in c.fetchall()}
+    conn.close()
+    return result
+
+
 def list_jours():
     conn = get_conn()
     c = conn.cursor()
@@ -171,7 +263,10 @@ def list_jours():
     return result
 
 
-def last_final_before(jour_date):
+def last_day_before(jour_date):
+    """Dernière journée enregistrée avant jour_date : sa date et son montant
+    final. Sert à reporter automatiquement le solde de caisse jour après jour,
+    et à détecter le début d'un nouveau mois (quand cette date change de mois)."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT jour_date, solde_initial, recettes FROM jours WHERE jour_date < ? ORDER BY jour_date DESC LIMIT 1", (jour_date,))
@@ -183,26 +278,71 @@ def last_final_before(jour_date):
     c.execute("SELECT COALESCE(SUM(montant),0) FROM depenses WHERE jour_id=(SELECT id FROM jours WHERE jour_date=?)", (d,))
     total_dep = c.fetchone()[0]
     conn.close()
-    return si + rec - total_dep
+    return {"date": d, "final": si + rec - total_dep}
+
+
+def _period_stats(start_date, end_date):
+    """Agrège les journées de start_date à end_date (inclus), en distinguant
+    les vraies dépenses des versements banque (qui ne sont pas des dépenses
+    mais réduisent quand même l'espèce en caisse)."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, jour_date, solde_initial, recettes FROM jours WHERE jour_date BETWEEN ? AND ? ORDER BY jour_date",
+              (start_date, end_date))
+    rows = c.fetchall()
+    total_recettes = total_depenses = total_versements = 0.0
+    par_categorie = {}
+    days = []
+    movements = []
+    for jour_id, jour_date, solde_initial, recettes in rows:
+        c.execute("SELECT categorie, motif, montant, piece_jointe FROM depenses WHERE jour_id=?", (jour_id,))
+        day_dep = day_vers = 0.0
+        if recettes:
+            movements.append({"date": jour_date, "type": "Recette", "categorie": "", "motif": "",
+                               "montant": recettes, "piece_jointe": None})
+        for cat, motif, montant, piece_jointe in c.fetchall():
+            par_categorie[cat] = par_categorie.get(cat, 0) + montant
+            is_versement = cat == CATEGORIE_VERSEMENT
+            if is_versement:
+                total_versements += montant
+                day_vers += montant
+            else:
+                total_depenses += montant
+                day_dep += montant
+            movements.append({"date": jour_date, "type": "Versement banque" if is_versement else "Dépense",
+                               "categorie": cat, "motif": motif, "montant": -montant, "piece_jointe": piece_jointe})
+        total_recettes += recettes
+        final = solde_initial + recettes - day_dep - day_vers
+        days.append({"date": jour_date, "solde_initial": solde_initial, "recettes": recettes,
+                      "depenses": day_dep, "versements": day_vers, "final": final})
+    conn.close()
+    return {
+        "start": start_date, "end": end_date, "nb_jours": len(days),
+        "total_recettes": total_recettes, "total_depenses": total_depenses,
+        "total_versements": total_versements, "par_categorie": par_categorie,
+        "days": days, "movements": movements,
+        "solde_debut": days[0]["solde_initial"] if days else None,
+        "solde_fin": days[-1]["final"] if days else None,
+    }
+
+
+def week_stats(monday_date):
+    """monday_date : 'YYYY-MM-DD' du lundi de la semaine voulue."""
+    end = (datetime.strptime(monday_date, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
+    return _period_stats(monday_date, end)
+
+
+def month_stats_full(year, month):
+    start = f"{year:04d}-{month:02d}-01"
+    end_day = calendar_mod.monthrange(year, month)[1]
+    end = f"{year:04d}-{month:02d}-{end_day:02d}"
+    return _period_stats(start, end)
 
 
 def monthly_stats(year_month):
     """year_month format 'YYYY-MM'"""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT id, recettes FROM jours WHERE jour_date LIKE ?", (year_month + "%",))
-    jours = c.fetchall()
-    total_recettes = sum(r for _, r in jours)
-    par_categorie = {}
-    total_depenses = 0.0
-    for jour_id, _ in jours:
-        c.execute("SELECT categorie, montant FROM depenses WHERE jour_id=?", (jour_id,))
-        for cat, montant in c.fetchall():
-            par_categorie[cat] = par_categorie.get(cat, 0) + montant
-            total_depenses += montant
-    conn.close()
-    return {"nb_jours": len(jours), "total_recettes": total_recettes,
-            "total_depenses": total_depenses, "par_categorie": par_categorie}
+    y, m = int(year_month[:4]), int(year_month[5:7])
+    return month_stats_full(y, m)
 
 
 # ---------------------------------------------------------------------------
@@ -226,16 +366,24 @@ def _logo_data_uri():
     return _LOGO_DATA_URI_CACHE
 
 
-def export_print_html(jour_date, solde_initial, recettes, expenses, total_depenses, final):
+def export_print_html(jour_date, solde_initial, recettes, expenses, total_depenses, total_versements, final):
     os.makedirs(EXPORTS_DIR, exist_ok=True)
-    rows = "".join(
-        f"<tr><td>{html.escape(e['motif'])}<span class='cat'>{html.escape(e['categorie'])}</span></td>"
-        f"<td class='amt'>{fmt(e['montant'])}</td></tr>"
-        for e in expenses
-    )
+    if expenses:
+        rows = "".join(
+            f"<tr><td>{html.escape(e['motif'])}</td>"
+            f"<td class='muted'>{html.escape(e['categorie'])}</td>"
+            f"<td class='amt'>{fmt(e['montant'])}</td></tr>"
+            for e in expenses
+        )
+    else:
+        rows = "<tr><td colspan='3' class='muted' style='text-align:center'>Aucune dépense ce jour</td></tr>"
     logo_uri = _logo_data_uri()
     logo_html = f'<img src="{logo_uri}" alt="Les Cinq Frères" class="logo">' if logo_uri else ""
     final_class = "positive" if final >= 0 else "negative"
+    try:
+        date_affichee = datetime.strptime(jour_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        date_affichee = jour_date
     content = f"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
 <title>Etat de caisse {jour_date}</title>
@@ -245,45 +393,72 @@ def export_print_html(jour_date, solde_initial, recettes, expenses, total_depens
    --muted:#5B6B79; --border:#DCE3E8; --success:#1B8A5A; --danger:#C1373B; --bg:#F4F6F8;
  }}
  * {{ box-sizing:border-box; }}
- body {{ font-family:'Segoe UI', Arial, sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:32px 16px; }}
- .card {{ max-width:480px; margin:0 auto; background:#fff; border:1px solid var(--border); border-radius:10px;
-          box-shadow:0 4px 14px rgba(0,78,116,0.08); overflow:hidden; }}
- .head {{ background:var(--navy-deep); color:#fff; padding:22px 24px; text-align:center; }}
- .logo {{ height:56px; margin-bottom:8px; }}
- .head h1 {{ margin:0; font-size:16px; letter-spacing:0.5px; }}
- .head p {{ margin:4px 0 0; font-size:12px; color:var(--teal); font-weight:600; }}
- .meta {{ text-align:center; padding:12px 24px 0; font-size:12px; color:var(--muted); }}
- table {{ width:100%; border-collapse:collapse; font-size:13px; }}
- .items {{ padding:8px 24px 0; }}
- .items td {{ padding:7px 0; border-bottom:1px solid var(--border); }}
- .items .cat {{ display:block; font-size:11px; color:var(--muted); }}
+ body {{ font-family:'Segoe UI', Arial, sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:40px 16px; font-size:15px; }}
+ .card {{ max-width:640px; margin:0 auto; background:#fff; border:1px solid var(--border); border-radius:12px;
+          box-shadow:0 6px 20px rgba(0,78,116,0.10); overflow:hidden; }}
+ .head {{ background:var(--navy-deep); color:#fff; padding:26px 48px; text-align:center; }}
+ .logo {{ height:56px; margin-bottom:10px; }}
+ .head h1 {{ margin:0; font-size:18px; letter-spacing:0.5px; }}
+ .head p {{ margin:5px 0 0; font-size:13px; color:var(--teal); font-weight:600; text-transform:uppercase; letter-spacing:1px; }}
+ .body {{ padding:0 48px 40px; }}
+ .date-row {{ display:flex; justify-content:space-between; align-items:baseline;
+              padding:20px 0 16px; border-bottom:2px solid var(--navy); margin-bottom:20px; }}
+ .date-row .label {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }}
+ .date-row .value {{ font-size:20px; font-weight:700; color:var(--navy); }}
+ .date-row .gen {{ font-size:11px; color:var(--muted); text-align:right; }}
+ table {{ width:100%; border-collapse:collapse; }}
+ .tbl-expenses {{ font-size:14px; border:1px solid var(--border); }}
+ .tbl-expenses th {{ background:var(--bg); color:var(--muted); font-size:11px; text-transform:uppercase;
+                      letter-spacing:0.5px; text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); }}
+ .tbl-expenses th.amt {{ text-align:right; }}
+ .tbl-expenses td {{ padding:9px 10px; border-bottom:1px solid var(--border); }}
+ .tbl-expenses tr:last-child td {{ border-bottom:none; }}
+ .muted {{ color:var(--muted); }}
  .amt {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }}
- .totals {{ padding:14px 24px 22px; }}
- .totals td {{ padding:5px 0; }}
- .totals tr.final td {{ padding-top:12px; border-top:2px solid var(--border); font-weight:700; font-size:16px; }}
+ .totals {{ margin-top:18px; font-size:15px; }}
+ .totals td {{ padding:6px 0; }}
+ .totals tr.final td {{ padding-top:14px; margin-top:6px; border-top:2px solid var(--navy);
+                         font-weight:700; font-size:20px; }}
  .totals tr.final.positive td {{ color:var(--success); }}
  .totals tr.final.negative td {{ color:var(--danger); }}
- .foot {{ text-align:center; padding:0 24px 22px; }}
- button {{ background:var(--navy); color:#fff; border:none; border-radius:6px; padding:10px 22px;
-           font-size:13px; font-weight:600; cursor:pointer; }}
+ .signatures {{ display:flex; gap:32px; margin-top:56px; }}
+ .sig-box {{ flex:1; text-align:center; }}
+ .sig-line {{ height:40px; border-bottom:1px solid var(--ink); }}
+ .sig-box span {{ display:block; margin-top:8px; font-size:12px; color:var(--muted); }}
+ .foot {{ text-align:center; padding:0 48px 28px; }}
+ button {{ background:var(--navy); color:#fff; border:none; border-radius:8px; padding:12px 28px;
+           font-size:14px; font-weight:600; cursor:pointer; }}
  button:hover {{ background:var(--navy-deep); }}
- @media print {{ body {{ background:#fff; padding:0; }} .card {{ box-shadow:none; border:none; }} .foot {{ display:none; }} }}
+ @media print {{ body {{ background:#fff; padding:0; }} .card {{ box-shadow:none; border:none; max-width:100%; }} .foot {{ display:none; }} }}
 </style></head>
 <body>
 <div class="card">
   <div class="head">
     {logo_html}
     <h1>SOCIÉTÉ MAGASIN LES CINQ FRÈRES</h1>
-    <p>État de caisse</p>
+    <p>État de caisse journalier</p>
   </div>
-  <p class="meta">{jour_date} — généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}</p>
-  <table class="items">{rows}</table>
-  <table class="totals">
-   <tr><td>Solde initial</td><td class="amt">{fmt(solde_initial)}</td></tr>
-   <tr><td>Recettes</td><td class="amt">+ {fmt(recettes)}</td></tr>
-   <tr><td>Total dépenses</td><td class="amt">- {fmt(total_depenses)}</td></tr>
-   <tr class="final {final_class}"><td>MONTANT FINAL</td><td class="amt">{fmt(final)}</td></tr>
-  </table>
+  <div class="body">
+    <div class="date-row">
+      <div><div class="label">Date</div><div class="value">{date_affichee}</div></div>
+      <div class="gen">Généré le<br>{datetime.now().strftime('%d/%m/%Y à %H:%M')}</div>
+    </div>
+    <table class="tbl-expenses">
+      <thead><tr><th>Désignation</th><th>Catégorie</th><th class="amt">Montant</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+    <table class="totals">
+     <tr><td>Solde initial</td><td class="amt">{fmt(solde_initial)}</td></tr>
+     <tr><td>Recette du jour</td><td class="amt">+ {fmt(recettes)}</td></tr>
+     <tr><td>Total dépenses</td><td class="amt">- {fmt(total_depenses)}</td></tr>
+     {"<tr><td>Versements banque</td><td class='amt'>- " + fmt(total_versements) + "</td></tr>" if total_versements else ""}
+     <tr class="final {final_class}"><td>SOLDE FINAL</td><td class="amt">{fmt(final)}</td></tr>
+    </table>
+    <div class="signatures">
+      <div class="sig-box"><div class="sig-line"></div><span>Signature caissier(ère)</span></div>
+      <div class="sig-box"><div class="sig-line"></div><span>Signature responsable</span></div>
+    </div>
+  </div>
   <div class="foot"><button onclick="window.print()">🖨 Imprimer</button></div>
 </div>
 </body></html>"""
@@ -291,6 +466,562 @@ def export_print_html(jour_date, solde_initial, recettes, expenses, total_depens
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     webbrowser.open(f"file://{path}")
+
+
+def export_period_report_html(period_type, period_label, filename_slug, stats):
+    """Rapport imprimable pour une période (semaine ou mois) : totaux,
+    répartition par catégorie et détail jour par jour."""
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+
+    if stats["par_categorie"]:
+        cat_rows = "".join(
+            f"<tr><td>{html.escape(cat)}</td><td class='amt'>{fmt(montant)}</td></tr>"
+            for cat, montant in sorted(stats["par_categorie"].items(), key=lambda x: -x[1])
+        )
+    else:
+        cat_rows = "<tr><td colspan='2' class='muted' style='text-align:center'>Aucune dépense</td></tr>"
+
+    if stats["days"]:
+        day_rows = "".join(
+            f"<tr><td>{d['date']}</td><td class='amt'>{fmt(d['recettes'])}</td>"
+            f"<td class='amt'>{fmt(d['depenses'])}</td><td class='amt'>{fmt(d['versements'])}</td>"
+            f"<td class='amt' style='font-weight:700; color:{SUCCESS if d['final'] >= 0 else DANGER}'>{fmt(d['final'])}</td></tr>"
+            for d in stats["days"]
+        )
+    else:
+        day_rows = "<tr><td colspan='5' class='muted' style='text-align:center'>Aucune journée enregistrée sur cette période</td></tr>"
+
+    solde_debut_txt = fmt(stats["solde_debut"]) if stats["solde_debut"] is not None else "—"
+    solde_fin_txt = fmt(stats["solde_fin"]) if stats["solde_fin"] is not None else "—"
+    final_class = "positive" if (stats["solde_fin"] or 0) >= 0 else "negative"
+    logo_uri = _logo_data_uri()
+    logo_html = f'<img src="{logo_uri}" alt="Les Cinq Frères" class="logo">' if logo_uri else ""
+
+    content = f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<title>Rapport {period_type.lower()} — {period_label}</title>
+<style>
+ :root {{
+   --navy:#004E74; --navy-deep:#00354F; --teal:#08A4B0; --ink:#1F2A33;
+   --muted:#5B6B79; --border:#DCE3E8; --success:#1B8A5A; --danger:#C1373B; --bg:#F4F6F8;
+ }}
+ * {{ box-sizing:border-box; }}
+ body {{ font-family:'Segoe UI', Arial, sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:40px 16px; font-size:14px; }}
+ .card {{ max-width:760px; margin:0 auto; background:#fff; border:1px solid var(--border); border-radius:12px;
+          box-shadow:0 6px 20px rgba(0,78,116,0.10); overflow:hidden; }}
+ .head {{ background:var(--navy-deep); color:#fff; padding:26px 48px; text-align:center; }}
+ .logo {{ height:52px; margin-bottom:10px; }}
+ .head h1 {{ margin:0; font-size:17px; letter-spacing:0.5px; }}
+ .head p {{ margin:5px 0 0; font-size:12px; color:var(--teal); font-weight:600; text-transform:uppercase; letter-spacing:1px; }}
+ .body {{ padding:0 48px 36px; }}
+ .period-row {{ display:flex; justify-content:space-between; align-items:baseline;
+                 padding:20px 0 16px; border-bottom:2px solid var(--navy); margin-bottom:20px; }}
+ .period-row .label {{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }}
+ .period-row .value {{ font-size:18px; font-weight:700; color:var(--navy); }}
+ .period-row .gen {{ font-size:11px; color:var(--muted); text-align:right; }}
+ h2.section {{ font-size:12px; text-transform:uppercase; letter-spacing:0.5px; color:var(--muted);
+               margin:22px 0 8px; }}
+ table {{ width:100%; border-collapse:collapse; }}
+ .tbl {{ font-size:13px; border:1px solid var(--border); }}
+ .tbl th {{ background:var(--bg); color:var(--muted); font-size:10.5px; text-transform:uppercase;
+            letter-spacing:0.5px; text-align:left; padding:7px 9px; border-bottom:1px solid var(--border); }}
+ .tbl th.amt {{ text-align:right; }}
+ .tbl td {{ padding:7px 9px; border-bottom:1px solid var(--border); }}
+ .tbl tr:last-child td {{ border-bottom:none; }}
+ .muted {{ color:var(--muted); }}
+ .amt {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }}
+ .totals {{ margin-top:6px; font-size:14px; }}
+ .totals td {{ padding:6px 0; }}
+ .totals tr.final td {{ padding-top:12px; border-top:2px solid var(--navy); font-weight:700; font-size:18px; }}
+ .totals tr.final.positive td {{ color:var(--success); }}
+ .totals tr.final.negative td {{ color:var(--danger); }}
+ .signatures {{ display:flex; gap:32px; margin-top:44px; }}
+ .sig-box {{ flex:1; text-align:center; }}
+ .sig-line {{ height:36px; border-bottom:1px solid var(--ink); }}
+ .sig-box span {{ display:block; margin-top:8px; font-size:11px; color:var(--muted); }}
+ .foot {{ text-align:center; padding:0 48px 26px; }}
+ button {{ background:var(--navy); color:#fff; border:none; border-radius:8px; padding:12px 28px;
+           font-size:14px; font-weight:600; cursor:pointer; }}
+ button:hover {{ background:var(--navy-deep); }}
+ @media print {{ body {{ background:#fff; padding:0; }} .card {{ box-shadow:none; border:none; max-width:100%; }} .foot {{ display:none; }} }}
+</style></head>
+<body>
+<div class="card">
+  <div class="head">
+    {logo_html}
+    <h1>SOCIÉTÉ MAGASIN LES CINQ FRÈRES</h1>
+    <p>Rapport {period_type.lower()}</p>
+  </div>
+  <div class="body">
+    <div class="period-row">
+      <div><div class="label">Période</div><div class="value">{period_label}</div></div>
+      <div class="gen">Généré le<br>{datetime.now().strftime('%d/%m/%Y à %H:%M')}</div>
+    </div>
+
+    <h2 class="section">Détail par jour</h2>
+    <table class="tbl">
+      <thead><tr><th>Date</th><th class="amt">Recettes</th><th class="amt">Dépenses</th>
+        <th class="amt">Versements</th><th class="amt">Solde final</th></tr></thead>
+      <tbody>{day_rows}</tbody>
+    </table>
+
+    <h2 class="section">Dépenses par catégorie</h2>
+    <table class="tbl">
+      <thead><tr><th>Catégorie</th><th class="amt">Montant</th></tr></thead>
+      <tbody>{cat_rows}</tbody>
+    </table>
+
+    <table class="totals">
+     <tr><td>Solde en début de période</td><td class="amt">{solde_debut_txt}</td></tr>
+     <tr><td>Total recettes</td><td class="amt">+ {fmt(stats['total_recettes'])}</td></tr>
+     <tr><td>Total dépenses</td><td class="amt">- {fmt(stats['total_depenses'])}</td></tr>
+     {"<tr><td>Total versements banque</td><td class='amt'>- " + fmt(stats['total_versements']) + "</td></tr>" if stats['total_versements'] else ""}
+     <tr class="final {final_class}"><td>SOLDE EN FIN DE PÉRIODE</td><td class="amt">{solde_fin_txt}</td></tr>
+    </table>
+
+    <div class="signatures">
+      <div class="sig-box"><div class="sig-line"></div><span>Signature responsable</span></div>
+    </div>
+  </div>
+  <div class="foot"><button onclick="window.print()">🖨 Imprimer</button></div>
+</div>
+</body></html>"""
+    path = os.path.join(EXPORTS_DIR, f"rapport_{filename_slug}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    webbrowser.open(f"file://{path}")
+
+
+def export_weekly_report(monday_date):
+    stats = week_stats(monday_date)
+    end = stats["end"]
+    try:
+        d1 = datetime.strptime(monday_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        d2 = datetime.strptime(end, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        d1, d2 = monday_date, end
+    label = f"Semaine du {d1} au {d2}"
+    export_period_report_html("Hebdomadaire", label, f"semaine_{monday_date}", stats)
+
+
+def export_monthly_report(year, month):
+    stats = month_stats_full(year, month)
+    label = f"{FR_MOIS[month - 1]} {year}"
+    export_period_report_html("Mensuel", label, f"mois_{year:04d}-{month:02d}", stats)
+
+
+def _num_fr(value):
+    """Nombre au format attendu par Excel en français (virgule décimale)."""
+    return f"{value:.3f}".replace(".", ",")
+
+
+def export_csv_report(period_label, filename_slug, stats):
+    """Export CSV pour le comptable : résumé, répartition par catégorie et
+    journal détaillé de tous les mouvements (recettes, dépenses, versements).
+    Séparateur point-virgule / virgule décimale : format attendu par Excel FR."""
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    path = os.path.join(EXPORTS_DIR, f"export_{filename_slug}.csv")
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+
+        w.writerow(["RÉSUMÉ DE LA PÉRIODE"])
+        w.writerow(["Période", period_label])
+        w.writerow(["Solde en début de période", _num_fr(stats["solde_debut"]) if stats["solde_debut"] is not None else ""])
+        w.writerow(["Total recettes", _num_fr(stats["total_recettes"])])
+        w.writerow(["Total dépenses", _num_fr(stats["total_depenses"])])
+        w.writerow(["Total versements banque", _num_fr(stats["total_versements"])])
+        w.writerow(["Solde en fin de période", _num_fr(stats["solde_fin"]) if stats["solde_fin"] is not None else ""])
+        w.writerow([])
+
+        w.writerow(["DÉPENSES PAR CATÉGORIE"])
+        w.writerow(["Catégorie", "Montant"])
+        for cat, montant in sorted(stats["par_categorie"].items(), key=lambda x: -x[1]):
+            w.writerow([cat, _num_fr(montant)])
+        w.writerow([])
+
+        w.writerow(["DÉTAIL JOUR PAR JOUR"])
+        w.writerow(["Date", "Solde initial", "Recettes", "Dépenses", "Versements banque", "Solde final"])
+        for d in stats["days"]:
+            w.writerow([d["date"], _num_fr(d["solde_initial"]), _num_fr(d["recettes"]),
+                        _num_fr(d["depenses"]), _num_fr(d["versements"]), _num_fr(d["final"])])
+        w.writerow([])
+
+        w.writerow(["JOURNAL DES MOUVEMENTS"])
+        w.writerow(["Date", "Type", "Catégorie", "Motif", "Montant", "Justificatif"])
+        for mv in stats["movements"]:
+            w.writerow([mv["date"], mv["type"], mv["categorie"], mv["motif"],
+                        _num_fr(mv["montant"]), "Oui" if mv["piece_jointe"] else ""])
+
+    if os.name == "nt":
+        os.startfile(path)
+    else:
+        webbrowser.open(f"file://{path}")
+    return path
+
+
+def export_weekly_csv(monday_date):
+    stats = week_stats(monday_date)
+    end = stats["end"]
+    try:
+        d1 = datetime.strptime(monday_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+        d2 = datetime.strptime(end, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        d1, d2 = monday_date, end
+    export_csv_report(f"Semaine du {d1} au {d2}", f"semaine_{monday_date}", stats)
+
+
+def export_monthly_csv(year, month):
+    stats = month_stats_full(year, month)
+    export_csv_report(f"{FR_MOIS[month - 1]} {year}", f"mois_{year:04d}-{month:02d}", stats)
+
+
+# ---------------------------------------------------------------------------
+# Calendrier mensuel (pur Tkinter — aucune dépendance), réutilisé à la fois
+# dans le sélecteur de date en popup et dans la vue Historique.
+# ---------------------------------------------------------------------------
+def render_month_calendar(container, year, month, *, selected_date=None, marked_dates=None,
+                            on_prev=None, on_next=None, on_pick=None, on_close=None, on_today=None):
+    for w in container.winfo_children():
+        w.destroy()
+    marked_dates = marked_dates or set()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    header = tk.Frame(container, bg=NAVY_DEEP)
+    header.pack(fill="x")
+    prev_lbl = tk.Label(header, text="◀", bg=NAVY_DEEP, fg="white", font=("Segoe UI", 10, "bold"),
+                          padx=12, pady=8, cursor="hand2")
+    prev_lbl.pack(side="left")
+    if on_prev:
+        prev_lbl.bind("<Button-1>", lambda e: on_prev())
+    tk.Label(header, text=f"{FR_MOIS[month - 1]} {year}", bg=NAVY_DEEP, fg="white",
+              font=("Segoe UI", 10, "bold")).pack(side="left", expand=True)
+    if on_close:
+        close_lbl = tk.Label(header, text="✕", bg=NAVY_DEEP, fg="#A9C2CF", font=("Segoe UI", 9, "bold"),
+                               padx=10, pady=8, cursor="hand2")
+        close_lbl.pack(side="right")
+        close_lbl.bind("<Button-1>", lambda e: on_close())
+    next_lbl = tk.Label(header, text="▶", bg=NAVY_DEEP, fg="white", font=("Segoe UI", 10, "bold"),
+                          padx=12, pady=8, cursor="hand2")
+    next_lbl.pack(side="right")
+    if on_next:
+        next_lbl.bind("<Button-1>", lambda e: on_next())
+
+    days_row = tk.Frame(container, bg=SURFACE)
+    days_row.pack(fill="x", pady=(8, 2))
+    for name in FR_JOURS:
+        tk.Label(days_row, text=name, bg=SURFACE, fg=MUTED, font=("Segoe UI", 8, "bold"),
+                  width=4).pack(side="left")
+
+    grid = tk.Frame(container, bg=SURFACE)
+    grid.pack(padx=6)
+    for week in calendar_mod.Calendar(firstweekday=0).monthdayscalendar(year, month):
+        row = tk.Frame(grid, bg=SURFACE)
+        row.pack()
+        for day in week:
+            if day == 0:
+                tk.Label(row, bg=SURFACE, width=4, height=2).pack(side="left")
+                continue
+            dstr = f"{year:04d}-{month:02d}-{day:02d}"
+            is_selected = dstr == selected_date
+            is_today = dstr == today_str
+            has_entry = dstr in marked_dates
+            bg = NAVY if is_selected else SURFACE
+            if is_selected:
+                fg = "white"
+            elif has_entry:
+                fg = TEAL_DARK
+            elif is_today:
+                fg = NAVY
+            else:
+                fg = INK
+            lbl = tk.Label(row, text=str(day), bg=bg, fg=fg, width=4, height=2, cursor="hand2",
+                            font=("Segoe UI", 9, "bold" if (is_selected or is_today or has_entry) else "normal"))
+            lbl.pack(side="left", padx=1, pady=1)
+            if on_pick:
+                lbl.bind("<Button-1>", lambda e, dd=day: on_pick(f"{year:04d}-{month:02d}-{dd:02d}"))
+
+    if on_today:
+        foot = tk.Frame(container, bg=SURFACE)
+        foot.pack(fill="x", pady=(2, 8))
+        today_lbl = tk.Label(foot, text="Aujourd'hui", bg=SURFACE, fg=TEAL_DARK,
+                              font=("Segoe UI", 8, "bold underline"), cursor="hand2")
+        today_lbl.pack()
+        today_lbl.bind("<Button-1>", lambda e: on_today())
+
+
+class CalendarPopup(tk.Toplevel):
+    def __init__(self, parent, initial_date, on_pick):
+        super().__init__(parent)
+        self.on_pick_final = on_pick
+        self.overrideredirect(True)
+        self.configure(bg=BORDER)
+
+        try:
+            y, m, _ = (int(p) for p in initial_date.split("-"))
+            self.selected_date = initial_date
+        except (ValueError, AttributeError):
+            today = datetime.now()
+            y, m = today.year, today.month
+            self.selected_date = today.strftime("%Y-%m-%d")
+        self.cur_year, self.cur_month = y, m
+
+        self.card = tk.Frame(self, bg=SURFACE)
+        self.card.pack(padx=1, pady=1)
+        self._build()
+
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.transient(parent)
+        # Fenêtre sans bordure : on force son affichage au premier plan,
+        # sinon elle peut se retrouver masquée derrière la fenêtre principale.
+        self.lift()
+        self.attributes("-topmost", True)
+        try:
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _build(self):
+        render_month_calendar(
+            self.card, self.cur_year, self.cur_month,
+            selected_date=self.selected_date,
+            marked_dates=days_with_entries(self.cur_year, self.cur_month),
+            on_prev=lambda: self._change_month(-1),
+            on_next=lambda: self._change_month(1),
+            on_pick=self._pick,
+            on_close=self.destroy,
+            on_today=self._pick_today,
+        )
+
+    def _change_month(self, delta):
+        m = self.cur_month + delta
+        y = self.cur_year
+        if m < 1:
+            m, y = 12, y - 1
+        elif m > 12:
+            m, y = 1, y + 1
+        self.cur_year, self.cur_month = y, m
+        self._build()
+
+    def _pick(self, dstr):
+        self.destroy()
+        self.on_pick_final(dstr)
+
+    def _pick_today(self):
+        self._pick(datetime.now().strftime("%Y-%m-%d"))
+
+
+# ---------------------------------------------------------------------------
+# Fenêtres de connexion / configuration du mot de passe
+#
+# PasswordSetupDialog et LoginDialog sont de VRAIES fenêtres racines (tk.Tk),
+# chacune pilotée par son propre mainloop() appelé depuis __main__ — et non
+# des Toplevel affichés via wait_window() avant qu'un mainloop() ne tourne.
+# Ce deuxième schéma (essayé d'abord) ne s'affichait pas de façon fiable.
+# ---------------------------------------------------------------------------
+def _auth_style(root):
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure("TEntry", fieldbackground=SURFACE, foreground=INK,
+                     bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, padding=6)
+    style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 8),
+                     background=NAVY, foreground="white", borderwidth=0, relief="flat")
+    style.map("Primary.TButton", background=[("active", NAVY_DEEP)])
+
+
+def _auth_field(card, label, var, show=None):
+    tk.Label(card, text=label, bg=SURFACE, fg=INK, font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(8, 2))
+    kwargs = {"show": show} if show else {}
+    entry = ttk.Entry(card, textvariable=var, width=34, **kwargs)
+    entry.pack(anchor="w")
+    return entry
+
+
+def _auth_center(win):
+    win.update_idletasks()
+    w, h = win.winfo_width(), win.winfo_height()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+    win.lift()
+    win.focus_force()
+
+
+class PasswordSetupDialog(tk.Tk):
+    """Premier lancement : définir le mot de passe + la question de secours."""
+
+    def __init__(self):
+        super().__init__()
+        self.result = False
+        self.title("Configuration — Livre de Caisse")
+        self.configure(bg=SURFACE)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        _auth_style(self)
+
+        card = tk.Frame(self, bg=SURFACE, padx=28, pady=24)
+        card.pack()
+        tk.Label(card, text="🔒 Sécuriser l'application", bg=SURFACE, fg=NAVY,
+                  font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        tk.Label(card, text="Définis un mot de passe pour protéger l'accès à la caisse.\n"
+                             "La question de secours permet de le réinitialiser en cas d'oubli.",
+                  bg=SURFACE, fg=MUTED, font=("Segoe UI", 9), wraplength=320, justify="left").pack(anchor="w", pady=(4, 0))
+
+        self.var_pw1 = tk.StringVar()
+        self.var_pw2 = tk.StringVar()
+        self.var_question = tk.StringVar()
+        self.var_answer = tk.StringVar()
+
+        _auth_field(card, "Mot de passe", self.var_pw1, show="•")
+        _auth_field(card, "Confirmer le mot de passe", self.var_pw2, show="•")
+        _auth_field(card, "Question de secours (ex: Nom du premier employé ?)", self.var_question)
+        _auth_field(card, "Réponse", self.var_answer)
+
+        ttk.Button(card, text="Valider", style="Primary.TButton",
+                    command=self._on_validate).pack(anchor="w", pady=(18, 0))
+
+        _auth_center(self)
+
+    def _on_validate(self):
+        pw1, pw2 = self.var_pw1.get(), self.var_pw2.get()
+        question, answer = self.var_question.get().strip(), self.var_answer.get().strip()
+        if len(pw1) < 4:
+            messagebox.showwarning("Mot de passe trop court", "Au moins 4 caractères.", parent=self)
+            return
+        if pw1 != pw2:
+            messagebox.showwarning("Erreur", "Les deux mots de passe ne correspondent pas.", parent=self)
+            return
+        if not question or not answer:
+            messagebox.showwarning("Champ manquant", "Merci de renseigner la question et la réponse de secours.", parent=self)
+            return
+        set_password(pw1, question, answer)
+        self.result = True
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = False
+        self.destroy()
+
+
+class ResetPasswordDialog(tk.Toplevel):
+    """Réinitialisation via la question de secours (mot de passe oublié),
+    ouverte depuis une fenêtre de connexion déjà affichée (mainloop actif)."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.result = False
+        self.title("Mot de passe oublié")
+        self.configure(bg=SURFACE)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        card = tk.Frame(self, bg=SURFACE, padx=28, pady=24)
+        card.pack()
+        tk.Label(card, text="Réinitialiser le mot de passe", bg=SURFACE, fg=NAVY,
+                  font=("Segoe UI", 12, "bold")).pack(anchor="w")
+
+        question = get_security_question() or "(aucune question de secours n'a été définie)"
+        tk.Label(card, text=question, bg=SURFACE, fg=INK, font=("Segoe UI", 9, "bold"),
+                  wraplength=320, justify="left").pack(anchor="w", pady=(10, 0))
+        self.var_answer = tk.StringVar()
+        _auth_field(card, "Réponse", self.var_answer)
+
+        self.var_pw1 = tk.StringVar()
+        self.var_pw2 = tk.StringVar()
+        _auth_field(card, "Nouveau mot de passe", self.var_pw1, show="•")
+        _auth_field(card, "Confirmer", self.var_pw2, show="•")
+
+        ttk.Button(card, text="Réinitialiser", style="Primary.TButton",
+                    command=self._on_validate).pack(anchor="w", pady=(18, 0))
+
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+        self.transient(parent)
+        self.lift()
+        self.attributes("-topmost", True)
+        self.after(200, lambda: self.attributes("-topmost", False))
+        self.focus_force()
+        self.grab_set()
+        self.wait_window(self)
+
+    def _on_validate(self):
+        if not check_security_answer(self.var_answer.get()):
+            messagebox.showerror("Réponse incorrecte", "Cette réponse ne correspond pas.", parent=self)
+            return
+        pw1, pw2 = self.var_pw1.get(), self.var_pw2.get()
+        if len(pw1) < 4:
+            messagebox.showwarning("Mot de passe trop court", "Au moins 4 caractères.", parent=self)
+            return
+        if pw1 != pw2:
+            messagebox.showwarning("Erreur", "Les deux mots de passe ne correspondent pas.", parent=self)
+            return
+        salt, h = _hash_secret(pw1)
+        set_config("password_salt", salt)
+        set_config("password_hash", h)
+        messagebox.showinfo("Mot de passe réinitialisé", "Tu peux maintenant te reconnecter.", parent=self)
+        self.result = True
+        self.destroy()
+
+
+class LoginDialog(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.result = False
+        self.title("Connexion — Livre de Caisse")
+        self.configure(bg=SURFACE)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        _auth_style(self)
+
+        card = tk.Frame(self, bg=SURFACE, padx=28, pady=24)
+        card.pack()
+
+        logo_path = os.path.join(ASSETS_DIR, "logo_header.png")
+        if os.path.exists(logo_path):
+            self._logo_img = tk.PhotoImage(file=logo_path)
+            tk.Label(card, image=self._logo_img, bg=SURFACE).pack(pady=(0, 8))
+
+        tk.Label(card, text="SOCIÉTÉ MAGASIN LES CINQ FRÈRES", bg=SURFACE, fg=NAVY,
+                  font=("Segoe UI", 12, "bold")).pack()
+        tk.Label(card, text="Entre le mot de passe pour continuer", bg=SURFACE, fg=MUTED,
+                  font=("Segoe UI", 9)).pack(pady=(2, 14))
+
+        self.var_pw = tk.StringVar()
+        entry = _auth_field(card, "Mot de passe", self.var_pw, show="•")
+        entry.bind("<Return>", lambda ev: self._on_validate())
+
+        self.lbl_error = tk.Label(card, text="", bg=SURFACE, fg=DANGER, font=("Segoe UI", 8, "bold"))
+        self.lbl_error.pack(pady=(6, 0))
+
+        ttk.Button(card, text="Se connecter", style="Primary.TButton",
+                    command=self._on_validate).pack(anchor="w", pady=(14, 0))
+
+        forgot = tk.Label(card, text="Mot de passe oublié ?", bg=SURFACE, fg=TEAL_DARK,
+                            font=("Segoe UI", 8, "underline"), cursor="hand2")
+        forgot.pack(pady=(10, 0))
+        forgot.bind("<Button-1>", lambda ev: self._on_forgot())
+
+        _auth_center(self)
+        entry.focus_set()
+
+    def _on_validate(self):
+        if check_password(self.var_pw.get()):
+            self.result = True
+            self.destroy()
+        else:
+            self.lbl_error.config(text="Mot de passe incorrect.", fg=DANGER)
+            self.var_pw.set("")
+
+    def _on_forgot(self):
+        if ResetPasswordDialog(self).result:
+            self.lbl_error.config(text="Mot de passe réinitialisé — reconnecte-toi.", fg=SUCCESS)
+
+    def _on_cancel(self):
+        self.result = False
+        self.destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -406,18 +1137,28 @@ class CaisseApp(tk.Tk):
     # ----- Saisie du jour -------------------------------------------------
     def _build_saisie_tab(self):
         f = self.tab_saisie
+
+        self.lbl_month_title = tk.Label(f, text="", bg=BG, fg=NAVY, font=("Segoe UI", 13, "bold"),
+                                          anchor="w", padx=16)
+        self.lbl_month_title.pack(fill="x", pady=(12, 0))
+
         top = ttk.Frame(f, style="Paper.TFrame")
-        top.pack(fill="x", padx=16, pady=(16, 8))
+        top.pack(fill="x", padx=16, pady=(4, 8))
 
-        ttk.Label(top, text="Date (AAAA-MM-JJ)", style="Cat.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="Date", style="Cat.TLabel").grid(row=0, column=0, sticky="w")
+        date_box = ttk.Frame(top, style="Paper.TFrame")
+        date_box.grid(row=1, column=0, sticky="w", padx=(0, 20))
         self.var_date = tk.StringVar()
-        e_date = ttk.Entry(top, textvariable=self.var_date, width=16)
-        e_date.grid(row=1, column=0, sticky="w", padx=(0, 20))
-        e_date.bind("<Return>", lambda e: self._new_day(self.var_date.get()))
+        e_date = ttk.Entry(date_box, textvariable=self.var_date, width=13, state="readonly")
+        e_date.pack(side="left")
+        self.btn_calendar = ttk.Button(date_box, text="📅", width=3, command=self._show_calendar)
+        self.btn_calendar.pack(side="left", padx=(4, 0))
 
-        ttk.Label(top, text="Solde initial", style="Cat.TLabel").grid(row=0, column=1, sticky="w")
+        self.lbl_solde_caption = ttk.Label(top, text="Solde initial", style="Cat.TLabel")
+        self.lbl_solde_caption.grid(row=0, column=1, sticky="w")
         self.var_solde = tk.StringVar(value="0")
-        ttk.Entry(top, textvariable=self.var_solde, width=14).grid(row=1, column=1, sticky="w", padx=(0, 20))
+        self.e_solde = ttk.Entry(top, textvariable=self.var_solde, width=14)
+        self.e_solde.grid(row=1, column=1, sticky="w", padx=(0, 20))
 
         ttk.Label(top, text="Recettes du jour", style="Cat.TLabel").grid(row=0, column=2, sticky="w")
         self.var_recettes = tk.StringVar(value="0")
@@ -440,13 +1181,19 @@ class CaisseApp(tk.Tk):
         self.var_montant = tk.StringVar()
         e_montant = ttk.Entry(add_frame, textvariable=self.var_montant, width=12)
         e_montant.grid(row=1, column=2, padx=(0, 10))
-        e_montant.bind("<Return>", lambda e: self._add_expense())
+        e_montant.bind("<Return>", lambda e: self.btn_add_expense.invoke())
 
-        ttk.Button(add_frame, text="+ Ajouter", command=self._add_expense).grid(row=1, column=3, padx=(0, 20))
+        self._editing_idx = None
+        self.btn_add_expense = ttk.Button(add_frame, text="+ Ajouter", style="Primary.TButton",
+                                            command=self._add_expense)
+        self.btn_add_expense.grid(row=1, column=3, padx=(0, 6))
+        self.btn_cancel_edit = ttk.Button(add_frame, text="✕ Annuler", command=self._cancel_edit)
+        self.btn_cancel_edit.grid(row=1, column=4, padx=(0, 20))
+        self.btn_cancel_edit.grid_remove()
 
-        ttk.Label(add_frame, text="Justificatif", style="Cat.TLabel").grid(row=0, column=4, sticky="w")
+        ttk.Label(add_frame, text="Justificatif", style="Cat.TLabel").grid(row=0, column=5, sticky="w")
         attach_box = ttk.Frame(add_frame, style="Paper.TFrame")
-        attach_box.grid(row=1, column=4, sticky="w")
+        attach_box.grid(row=1, column=5, sticky="w")
         self._pending_attachment = None
         ttk.Button(attach_box, text="📎 Joindre", command=self._pick_attachment).pack(side="left")
         self.lbl_attachment = tk.Label(attach_box, text="aucun fichier", bg=BG, fg=MUTED,
@@ -487,8 +1234,12 @@ class CaisseApp(tk.Tk):
         self.dep_canvas.bind("<Button-1>", lambda e: self.dep_canvas.focus_set())
         self.dep_canvas.bind("<Delete>", lambda e: self._remove_selected_expense())
 
-        del_btn = ttk.Button(f, text="Supprimer la dépense sélectionnée", command=self._remove_selected_expense)
-        del_btn.pack(anchor="w", padx=16)
+        row_actions = ttk.Frame(f, style="Paper.TFrame")
+        row_actions.pack(fill="x", padx=16)
+        ttk.Button(row_actions, text="✏️ Modifier la dépense sélectionnée",
+                    command=self._edit_selected_expense).pack(side="left", padx=(0, 10))
+        ttk.Button(row_actions, text="Supprimer la dépense sélectionnée",
+                    command=self._remove_selected_expense).pack(side="left")
 
         # Résumé
         summary = tk.Frame(f, bg=NAVY_DEEP)
@@ -509,21 +1260,73 @@ class CaisseApp(tk.Tk):
         ttk.Button(actions, text="🖨 Imprimer / Exporter", style="Accent.TButton",
                     command=self._print_current).pack(side="left")
 
+    def _show_calendar(self):
+        if getattr(self, "_calendar_popup", None) is not None:
+            try:
+                self._calendar_popup.destroy()
+            except tk.TclError:
+                pass
+            self._calendar_popup = None
+            return
+
+        popup = CalendarPopup(self, self.var_date.get(), self._on_date_picked)
+        self._calendar_popup = popup
+        popup.bind("<Destroy>", self._on_calendar_closed, add="+")
+
+        self.update_idletasks()
+        x = self.btn_calendar.winfo_rootx()
+        y = self.btn_calendar.winfo_rooty() + self.btn_calendar.winfo_height() + 2
+        popup.update_idletasks()
+        pw, ph = popup.winfo_reqwidth(), popup.winfo_reqheight()
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        x = max(0, min(x, screen_w - pw))
+        y = max(0, min(y, screen_h - ph))
+        popup.geometry(f"+{x}+{y}")
+
+    def _on_calendar_closed(self, event):
+        if event.widget is self._calendar_popup:
+            self._calendar_popup = None
+
+    def _on_date_picked(self, jour_date):
+        self._new_day(jour_date)
+
     def _new_day(self, jour_date):
         self.var_date.set(jour_date)
+        try:
+            y, m, _ = (int(p) for p in jour_date.split("-"))
+            self.lbl_month_title.config(text=f"🗓  CAISSE — {FR_MOIS[m - 1].upper()} {y}")
+        except (ValueError, IndexError):
+            self.lbl_month_title.config(text="")
+
+        prev = last_day_before(jour_date)
+        # Un nouveau mois commence dès que le jour précédent enregistré
+        # appartient à un mois différent (ou qu'il n'y a pas de jour précédent) :
+        # c'est à ce moment-là qu'on saisit le solde de départ du mois.
+        is_month_start = prev is None or prev["date"][:7] != jour_date[:7]
+
         existing = load_jour(jour_date)
         if existing:
-            self.var_solde.set(str(existing["solde_initial"]))
             self.var_recettes.set(str(existing["recettes"]))
             self.expenses = list(existing["expenses"])
         else:
-            prev_final = last_final_before(jour_date)
-            self.var_solde.set(str(round(prev_final, 3)) if prev_final is not None else "0")
             self.var_recettes.set("0")
             self.expenses = []
+
+        if is_month_start:
+            # Début de mois : solde saisi à la main (celui déjà enregistré s'il
+            # y en a un, sinon 0 par défaut).
+            self.lbl_solde_caption.config(text="Solde de départ du mois")
+            self.var_solde.set(str(existing["solde_initial"]) if existing else "0")
+            self.e_solde.configure(state="normal")
+        else:
+            # En cours de mois : toujours repris automatiquement du montant
+            # final de la veille, non modifiable à la main.
+            self.lbl_solde_caption.config(text="Solde initial (jour précédent)")
+            self.var_solde.set(str(round(prev["final"], 3)))
+            self.e_solde.configure(state="readonly")
+
         self.selected_expense_idx = None
-        self._pending_attachment = None
-        self.lbl_attachment.config(text="aucun fichier", fg=MUTED)
+        self._cancel_edit()
         self._refresh_expense_list()
         self._refresh_summary()
 
@@ -562,7 +1365,58 @@ class CaisseApp(tk.Tk):
         idx = self.selected_expense_idx
         if idx is None or idx >= len(self.expenses):
             return
+        if idx == self._editing_idx:
+            self._cancel_edit()
         del self.expenses[idx]
+        self.selected_expense_idx = None
+        self._refresh_expense_list()
+        self._refresh_summary()
+
+    def _edit_selected_expense(self):
+        idx = self.selected_expense_idx
+        if idx is None or idx >= len(self.expenses):
+            messagebox.showinfo("Aucune sélection", "Sélectionnez d'abord une dépense dans le tableau.")
+            return
+        self._enter_edit_mode(idx)
+
+    def _enter_edit_mode(self, idx):
+        e = self.expenses[idx]
+        self._editing_idx = idx
+        self.var_motif.set(e["motif"])
+        self.var_cat.set(e["categorie"])
+        self.var_montant.set(str(e["montant"]))
+        self._pending_attachment = e.get("piece_jointe")
+        if self._pending_attachment:
+            self.lbl_attachment.config(text="✓ Justificatif joint", fg=SUCCESS)
+        else:
+            self.lbl_attachment.config(text="aucun fichier", fg=MUTED)
+        self.btn_add_expense.config(text="✔ Enregistrer la modification", command=self._save_expense_edit)
+        self.btn_cancel_edit.grid()
+        self._select_expense_row(idx)
+
+    def _cancel_edit(self):
+        self._editing_idx = None
+        self.var_motif.set("")
+        self.var_cat.set(CATEGORIES[0])
+        self.var_montant.set("")
+        self._pending_attachment = None
+        self.lbl_attachment.config(text="aucun fichier", fg=MUTED)
+        self.btn_add_expense.config(text="+ Ajouter", command=self._add_expense)
+        self.btn_cancel_edit.grid_remove()
+
+    def _save_expense_edit(self):
+        motif = self.var_motif.get().strip()
+        try:
+            montant = float(self.var_montant.get().replace(",", "."))
+        except ValueError:
+            montant = 0
+        if not motif or montant <= 0:
+            messagebox.showwarning("Champ manquant", "Merci d'indiquer un motif et un montant valide.")
+            return
+        idx = self._editing_idx
+        self.expenses[idx] = {"motif": motif, "categorie": self.var_cat.get(), "montant": montant,
+                               "piece_jointe": self._pending_attachment}
+        self._cancel_edit()
         self.selected_expense_idx = None
         self._refresh_expense_list()
         self._refresh_summary()
@@ -620,6 +1474,7 @@ class CaisseApp(tk.Tk):
 
             for w in (row, left, amt, *left.winfo_children()):
                 w.bind("<Button-1>", lambda ev, idx=i: self._select_expense_row(idx))
+                w.bind("<Double-Button-1>", lambda ev, idx=i: self._enter_edit_mode(idx))
             self._expense_row_widgets.append(row)
 
         self._highlight_selected_row()
@@ -633,17 +1488,25 @@ class CaisseApp(tk.Tk):
             recettes = float(self.var_recettes.get().replace(",", "."))
         except ValueError:
             recettes = 0
-        total_dep = sum(e["montant"] for e in self.expenses)
-        final = solde + recettes - total_dep
-        return solde, recettes, total_dep, final
+        # Le versement banque n'est pas une vraie dépense (l'argent n'est pas
+        # perdu, juste déplacé) : on le compte à part, même s'il réduit aussi
+        # l'espèce en caisse comme une dépense classique.
+        total_dep = sum(e["montant"] for e in self.expenses if e["categorie"] != CATEGORIE_VERSEMENT)
+        total_vers = sum(e["montant"] for e in self.expenses if e["categorie"] == CATEGORIE_VERSEMENT)
+        final = solde + recettes - total_dep - total_vers
+        return solde, recettes, total_dep, total_vers, final
 
     def _refresh_summary(self):
-        solde, recettes, total_dep, final = self._totals()
+        solde, recettes, total_dep, total_vers, final = self._totals()
+        nb_vers = sum(1 for e in self.expenses if e["categorie"] == CATEGORIE_VERSEMENT)
+        nb_dep = len(self.expenses) - nb_vers
         self.txt_summary.configure(state="normal")
         self.txt_summary.delete("1.0", "end")
         self.txt_summary.insert("end", f"Solde initial ......... {fmt(solde)}\n", "muted")
         self.txt_summary.insert("end", f"Recettes ............... + {fmt(recettes)}\n", "muted")
-        self.txt_summary.insert("end", f"Total dépenses ({len(self.expenses)}) ...... - {fmt(total_dep)}\n", "muted")
+        self.txt_summary.insert("end", f"Dépenses ({nb_dep}) ................ - {fmt(total_dep)}\n", "muted")
+        if nb_vers:
+            self.txt_summary.insert("end", f"Versements banque ({nb_vers}) ...... - {fmt(total_vers)}\n", "muted")
         self.txt_summary.insert("end", f"{'-'*38}\n", "muted")
         tag = "positive" if final >= 0 else "negative"
         self.txt_summary.insert("end", f"MONTANT FINAL CAISSE ... {fmt(final)}", tag)
@@ -656,68 +1519,170 @@ class CaisseApp(tk.Tk):
         except ValueError:
             messagebox.showerror("Date invalide", "Utilisez le format AAAA-MM-JJ.")
             return
-        solde, recettes, _, _ = self._totals()
+        solde, recettes, _, _, _ = self._totals()
         upsert_jour(jour_date, solde, recettes, self.expenses)
         messagebox.showinfo("Enregistré", f"Journée du {jour_date} enregistrée.")
         self._refresh_all()
 
     def _print_current(self):
-        solde, recettes, total_dep, final = self._totals()
-        export_print_html(self.var_date.get(), solde, recettes, self.expenses, total_dep, final)
+        solde, recettes, total_dep, total_vers, final = self._totals()
+        export_print_html(self.var_date.get(), solde, recettes, self.expenses, total_dep, total_vers, final)
 
     # ----- Historique -------------------------------------------------
     def _build_historique_tab(self):
         f = self.tab_hist
-        cols = ("date", "recettes", "depenses", "final")
-        self.tree_hist = ttk.Treeview(f, columns=cols, show="headings", height=18)
-        headers = {"date": "Date", "recettes": "Recettes", "depenses": "Dépenses", "final": "Montant final"}
-        for c in cols:
-            self.tree_hist.heading(c, text=headers[c])
-            self.tree_hist.column(c, width=180, anchor="center" if c != "date" else "w")
-        self.tree_hist.pack(fill="both", expand=True, padx=16, pady=16)
-        self.tree_hist.bind("<Double-1>", self._open_selected_day)
-        self.tree_hist.tag_configure("even", background=SURFACE)
-        self.tree_hist.tag_configure("odd", background=BG)
-        self.tree_hist.tag_configure("deficit", foreground=DANGER)
+        container = ttk.Frame(f, style="Paper.TFrame")
+        container.pack(fill="both", expand=True, padx=16, pady=16)
 
-        btns = ttk.Frame(f, style="Paper.TFrame")
-        btns.pack(fill="x", padx=16, pady=(0, 12))
+        today = datetime.now()
+        self.hist_cal_year, self.hist_cal_month = today.year, today.month
+        cal_card = tk.Frame(container, bg=BORDER)
+        cal_card.pack(side="left", fill="y", padx=(0, 16))
+        self.hist_cal_container = tk.Frame(cal_card, bg=SURFACE)
+        self.hist_cal_container.pack(padx=1, pady=1)
+        tk.Label(container, text="", bg=BG, width=1).pack(side="left")  # léger espace
+
+        right_col = ttk.Frame(container, style="Paper.TFrame")
+        right_col.pack(side="left", fill="both", expand=True)
+
+        self.selected_hist_date = None
+        self._hist_row_widgets = {}
+
+        card = tk.Frame(right_col, bg=BORDER)
+        card.pack(fill="both", expand=True)
+        inner = tk.Frame(card, bg=SURFACE)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        head = tk.Frame(inner, bg=NAVY)
+        head.pack(fill="x")
+        head.columnconfigure(0, weight=1)
+        tk.Label(head, text="DATE", bg=NAVY, fg="white", font=("Segoe UI", 10, "bold"),
+                  anchor="w", padx=14, pady=10).grid(row=0, column=0, sticky="ew")
+        tk.Label(head, text="RECETTES", bg=NAVY, fg="white", font=("Segoe UI", 10, "bold"),
+                  anchor="e", padx=14, pady=10, width=14).grid(row=0, column=1, sticky="e")
+        tk.Label(head, text="DÉPENSES", bg=NAVY, fg="white", font=("Segoe UI", 10, "bold"),
+                  anchor="e", padx=14, pady=10, width=14).grid(row=0, column=2, sticky="e")
+        tk.Label(head, text="MONTANT FINAL", bg=NAVY, fg="white", font=("Segoe UI", 10, "bold"),
+                  anchor="e", padx=14, pady=10, width=16).grid(row=0, column=3, sticky="e")
+
+        rows_area = tk.Frame(inner, bg=SURFACE)
+        rows_area.pack(fill="both", expand=True)
+        self.hist_canvas = tk.Canvas(rows_area, bg=SURFACE, highlightthickness=0, takefocus=1)
+        vsb = ttk.Scrollbar(rows_area, orient="vertical", command=self.hist_canvas.yview)
+        self.hist_canvas.configure(yscrollcommand=vsb.set)
+        self.hist_canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.hist_rows_frame = tk.Frame(self.hist_canvas, bg=SURFACE)
+        self._hist_canvas_window = self.hist_canvas.create_window((0, 0), window=self.hist_rows_frame, anchor="nw")
+        self.hist_rows_frame.bind("<Configure>", lambda e: self.hist_canvas.configure(scrollregion=self.hist_canvas.bbox("all")))
+        self.hist_canvas.bind("<Configure>", lambda e: self.hist_canvas.itemconfig(self._hist_canvas_window, width=e.width))
+
+        btns = ttk.Frame(right_col, style="Paper.TFrame")
+        btns.pack(fill="x", pady=(12, 0))
         ttk.Button(btns, text="Ouvrir dans Saisie", command=self._open_selected_day).pack(side="left", padx=(0, 10))
         ttk.Button(btns, text="🖨 Imprimer ce jour", style="Accent.TButton",
                     command=self._print_selected_history).pack(side="left")
 
+        self._refresh_hist_calendar()
+
+    def _refresh_hist_calendar(self):
+        render_month_calendar(
+            self.hist_cal_container, self.hist_cal_year, self.hist_cal_month,
+            marked_dates=days_with_entries(self.hist_cal_year, self.hist_cal_month),
+            on_prev=lambda: self._hist_change_month(-1),
+            on_next=lambda: self._hist_change_month(1),
+            on_pick=self._hist_pick_day,
+            on_today=self._hist_pick_today,
+        )
+
+    def _hist_change_month(self, delta):
+        m = self.hist_cal_month + delta
+        y = self.hist_cal_year
+        if m < 1:
+            m, y = 12, y - 1
+        elif m > 12:
+            m, y = 1, y + 1
+        self.hist_cal_year, self.hist_cal_month = y, m
+        self._refresh_hist_calendar()
+
+    def _hist_pick_day(self, jour_date):
+        self._new_day(jour_date)
+        self.notebook.select(self.tab_saisie)
+
+    def _hist_pick_today(self):
+        self._hist_pick_day(datetime.now().strftime("%Y-%m-%d"))
+
     def _refresh_historique(self):
-        self.tree_hist.delete(*self.tree_hist.get_children())
-        for i, rec in enumerate(list_jours()):
-            tags = ["even" if i % 2 == 0 else "odd"]
-            if rec["final"] < 0:
-                tags.append("deficit")
-            self.tree_hist.insert("", "end", iid=rec["date"], values=(
-                rec["date"], fmt(rec["recettes"]), fmt(rec["total_depenses"]), fmt(rec["final"])
-            ), tags=tags)
+        for w in self.hist_rows_frame.winfo_children():
+            w.destroy()
+        self._hist_row_widgets = {}
+
+        records = list_jours()
+        if not records:
+            tk.Label(self.hist_rows_frame, text="Aucune journée enregistrée pour l'instant.",
+                      bg=SURFACE, fg=MUTED, font=("Segoe UI", 9, "italic"), pady=22).pack(fill="x")
+            self._highlight_selected_hist_row()
+            return
+
+        for i, rec in enumerate(records):
+            rowbg = SURFACE if i % 2 == 0 else BG
+            row = tk.Frame(self.hist_rows_frame, bg=rowbg, cursor="hand2")
+            row.pack(fill="x")
+            row.columnconfigure(0, weight=1)
+
+            tk.Label(row, text=rec["date"], bg=rowbg, fg=INK, font=("Segoe UI", 11, "bold"),
+                      anchor="w", padx=14, pady=10).grid(row=0, column=0, sticky="w")
+            tk.Label(row, text=fmt(rec["recettes"]), bg=rowbg, fg=INK, font=("Consolas", 11),
+                      anchor="e", padx=14, width=14).grid(row=0, column=1, sticky="e")
+            tk.Label(row, text=fmt(rec["total_depenses"]), bg=rowbg, fg=INK, font=("Consolas", 11),
+                      anchor="e", padx=14, width=14).grid(row=0, column=2, sticky="e")
+            final_color = SUCCESS if rec["final"] >= 0 else DANGER
+            tk.Label(row, text=fmt(rec["final"]), bg=rowbg, fg=final_color, font=("Consolas", 12, "bold"),
+                      anchor="e", padx=14, width=16).grid(row=0, column=3, sticky="e")
+
+            tk.Frame(self.hist_rows_frame, bg=BORDER, height=1).pack(fill="x")
+
+            for w in (row, *row.winfo_children()):
+                w.bind("<Button-1>", lambda ev, d=rec["date"]: self._select_hist_row(d))
+                w.bind("<Double-Button-1>", lambda ev, d=rec["date"]: self._hist_pick_day(d))
+            self._hist_row_widgets[rec["date"]] = row
+
+        self._highlight_selected_hist_row()
+
+    def _select_hist_row(self, jour_date):
+        self.selected_hist_date = jour_date
+        self._highlight_selected_hist_row()
+
+    def _highlight_selected_hist_row(self):
+        for i, (d, row) in enumerate(self._hist_row_widgets.items()):
+            base = SURFACE if i % 2 == 0 else BG
+            color = "#D3ECEE" if d == self.selected_hist_date else base
+            self._set_widget_bg(row, color)
 
     def _open_selected_day(self, event=None):
-        sel = self.tree_hist.selection()
-        if not sel:
+        if not self.selected_hist_date:
+            messagebox.showinfo("Aucune sélection", "Sélectionnez une journée dans la liste.")
             return
-        self._new_day(sel[0])
+        self._new_day(self.selected_hist_date)
         self.notebook.select(self.tab_saisie)
 
     def _print_selected_history(self):
-        sel = self.tree_hist.selection()
-        if not sel:
+        if not self.selected_hist_date:
             messagebox.showinfo("Aucune sélection", "Sélectionnez une journée dans la liste.")
             return
-        rec = load_jour(sel[0])
-        total_dep = sum(e["montant"] for e in rec["expenses"])
-        final = rec["solde_initial"] + rec["recettes"] - total_dep
-        export_print_html(rec["jour_date"], rec["solde_initial"], rec["recettes"], rec["expenses"], total_dep, final)
+        rec = load_jour(self.selected_hist_date)
+        total_dep = sum(e["montant"] for e in rec["expenses"] if e["categorie"] != CATEGORIE_VERSEMENT)
+        total_vers = sum(e["montant"] for e in rec["expenses"] if e["categorie"] == CATEGORIE_VERSEMENT)
+        final = rec["solde_initial"] + rec["recettes"] - total_dep - total_vers
+        export_print_html(rec["jour_date"], rec["solde_initial"], rec["recettes"], rec["expenses"],
+                            total_dep, total_vers, final)
 
     # ----- Tableau de bord -------------------------------------------------
     def _build_dashboard_tab(self):
         f = self.tab_dash
         top = ttk.Frame(f, style="Paper.TFrame")
-        top.pack(fill="x", padx=16, pady=16)
+        top.pack(fill="x", padx=16, pady=(16, 8))
         ttk.Label(top, text="Mois (AAAA-MM)", style="Cat.TLabel").pack(side="left", padx=(0, 8))
         self.var_month = tk.StringVar(value=datetime.now().strftime("%Y-%m"))
         e = ttk.Entry(top, textvariable=self.var_month, width=10)
@@ -725,6 +1690,24 @@ class CaisseApp(tk.Tk):
         e.bind("<Return>", lambda ev: self._refresh_dashboard())
         ttk.Button(top, text="Actualiser", style="Primary.TButton",
                     command=self._refresh_dashboard).pack(side="left", padx=8)
+        ttk.Button(top, text="🖨 Rapport du mois", style="Accent.TButton",
+                    command=self._print_month_report).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="📊 Export CSV (comptable)",
+                    command=self._export_month_csv).pack(side="left", padx=(8, 0))
+
+        today = datetime.now()
+        self.cur_week_monday = today - timedelta(days=today.weekday())
+        week_bar = ttk.Frame(f, style="Paper.TFrame")
+        week_bar.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Label(week_bar, text="Semaine", style="Cat.TLabel").pack(side="left", padx=(0, 8))
+        ttk.Button(week_bar, text="◀", width=3, command=lambda: self._change_week(-1)).pack(side="left")
+        self.lbl_week_range = ttk.Label(week_bar, text="", font=("Segoe UI", 10, "bold"))
+        self.lbl_week_range.pack(side="left", padx=8)
+        ttk.Button(week_bar, text="▶", width=3, command=lambda: self._change_week(1)).pack(side="left")
+        ttk.Button(week_bar, text="🖨 Rapport de la semaine", style="Accent.TButton",
+                    command=self._print_week_report).pack(side="left", padx=(12, 0))
+        ttk.Button(week_bar, text="📊 Export CSV (comptable)",
+                    command=self._export_week_csv).pack(side="left", padx=(8, 0))
 
         self.txt_dash = tk.Text(f, font=("Consolas", 11), bg=SURFACE, fg=INK, relief="flat",
                                  height=26, wrap="word", highlightthickness=0, borderwidth=0)
@@ -734,6 +1717,41 @@ class CaisseApp(tk.Tk):
         self.txt_dash.tag_configure("cat", foreground=INK, font=("Consolas", 11, "bold"))
         self.txt_dash.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
+        self._refresh_week_label()
+
+    def _change_week(self, delta):
+        self.cur_week_monday += timedelta(days=7 * delta)
+        self._refresh_week_label()
+
+    def _refresh_week_label(self):
+        monday = self.cur_week_monday
+        sunday = monday + timedelta(days=6)
+        self.lbl_week_range.config(text=f"Du {monday.strftime('%d/%m/%Y')} au {sunday.strftime('%d/%m/%Y')}")
+
+    def _print_week_report(self):
+        export_weekly_report(self.cur_week_monday.strftime("%Y-%m-%d"))
+
+    def _export_week_csv(self):
+        export_weekly_csv(self.cur_week_monday.strftime("%Y-%m-%d"))
+
+    def _parse_month_field(self):
+        year_month = self.var_month.get().strip()
+        try:
+            return int(year_month[:4]), int(year_month[5:7])
+        except (ValueError, IndexError):
+            messagebox.showerror("Mois invalide", "Utilisez le format AAAA-MM.")
+            return None
+
+    def _print_month_report(self):
+        ym = self._parse_month_field()
+        if ym:
+            export_monthly_report(*ym)
+
+    def _export_month_csv(self):
+        ym = self._parse_month_field()
+        if ym:
+            export_monthly_csv(*ym)
+
     def _refresh_dashboard(self):
         stats = monthly_stats(self.var_month.get().strip())
         self.txt_dash.config(state="normal")
@@ -742,7 +1760,10 @@ class CaisseApp(tk.Tk):
         self.txt_dash.insert("end", "=" * 46 + "\n\n", "muted")
         self.txt_dash.insert("end", f"Jours enregistrés ......... {stats['nb_jours']}\n")
         self.txt_dash.insert("end", f"Total recettes ............ {fmt(stats['total_recettes'])}\n")
-        self.txt_dash.insert("end", f"Total dépenses ............ {fmt(stats['total_depenses'])}\n\n")
+        self.txt_dash.insert("end", f"Total dépenses ............ {fmt(stats['total_depenses'])}\n")
+        if stats["total_versements"]:
+            self.txt_dash.insert("end", f"Versements banque ......... {fmt(stats['total_versements'])}\n")
+        self.txt_dash.insert("end", "\n")
         self.txt_dash.insert("end", "Dépenses par catégorie :\n", "title")
         self.txt_dash.insert("end", "-" * 46 + "\n", "muted")
         maxv = max(stats["par_categorie"].values(), default=1)
@@ -757,10 +1778,36 @@ class CaisseApp(tk.Tk):
 
     def _refresh_all(self):
         self._refresh_historique()
+        self._refresh_hist_calendar()
         self._refresh_dashboard()
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        # Sans cela, sur un écran avec mise à l'échelle Windows (125%, 150%...),
+        # les coordonnées Tkinter ne correspondent plus aux pixels réels et les
+        # fenêtres (ex: le calendrier) s'affichent au mauvais endroit.
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
     init_db()
+
+    # Écran de connexion (ou création du mot de passe au tout premier lancement)
+    # avant d'afficher la caisse elle-même.
+    if not is_password_configured():
+        auth_dlg = PasswordSetupDialog()
+    else:
+        auth_dlg = LoginDialog()
+    auth_dlg.mainloop()
+    authorized = auth_dlg.result
+    if not authorized:
+        sys.exit(0)
+
     app = CaisseApp()
     app.mainloop()

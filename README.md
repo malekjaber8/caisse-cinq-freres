@@ -8,12 +8,17 @@ en ligne : tout est stocké dans un fichier `caisse.db` (base SQLite) créé aut
 
 1. Installer Python 3 (gratuit) depuis https://www.python.org/downloads/ si ce n'est pas déjà fait
    (cocher "Add Python to PATH" pendant l'installation).
-2. Placer `caisse_app.py` dans un dossier, par exemple `C:\CaisseCinqFreres\`.
-3. Double-cliquer dessus, ou ouvrir un terminal dans ce dossier et taper :
+2. Placer tout le dossier du projet (`caisse_app.py`, `Lancer Livre de Caisse.pyw`, `assets/`...)
+   dans un dossier, par exemple `C:\CaisseCinqFreres\`.
+3. Pour l'usage quotidien : **double-clique sur `Lancer Livre de Caisse.pyw`** — ça ouvre
+   uniquement la fenêtre de l'application, sans fenêtre noire de terminal à côté.
+   (`tkinter` est inclus avec Python, aucune autre installation n'est nécessaire)
+
+   Pour le développement/débogage (voir les messages d'erreur éventuels dans un terminal),
+   utilise plutôt `caisse_app.py` directement :
    ```
    python caisse_app.py
    ```
-   (`tkinter` est inclus avec Python, aucune autre installation n'est nécessaire)
 
 ## 2. Transformer en vrai logiciel .exe (optionnel, pour ton patron)
 
