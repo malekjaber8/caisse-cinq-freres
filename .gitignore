@@ -3,6 +3,7 @@ caisse.db
 caisse.db-journal
 etats_imprimes/
 justificatifs/
+sauvegardes/
 
 # Python
 __pycache__/

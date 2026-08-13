@@ -29,6 +29,8 @@ EXPORTS_DIR = os.path.join(APP_DIR, "etats_imprimes")
 ASSETS_DIR = os.path.join(APP_DIR, "assets")
 ATTACHMENTS_DIR = os.path.join(APP_DIR, "justificatifs")
 ATTACHMENT_FILETYPES = [("Photos et PDF", "*.jpg *.jpeg *.png *.pdf"), ("Tous les fichiers", "*.*")]
+BACKUP_DIR = os.path.join(APP_DIR, "sauvegardes")
+BACKUP_RETENTION_DAYS = 30
 
 CATEGORIE_VERSEMENT = "Versement banque"
 
@@ -176,6 +178,53 @@ def check_security_answer(answer):
     if not salt or not h:
         return False
     return _verify_secret(answer.strip().lower(), salt, h)
+
+
+# ---------------------------------------------------------------------------
+# Sauvegarde automatique (caisse.db + justificatifs) dans sauvegardes/
+# ---------------------------------------------------------------------------
+def backup_now():
+    """Copie caisse.db et les justificatifs dans sauvegardes/, horodatés.
+    Best-effort : ne lève jamais d'exception (ne doit jamais bloquer l'appli)."""
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
+        db_backup = os.path.join(BACKUP_DIR, f"caisse_{stamp}.db")
+        shutil.copy2(DB_PATH, db_backup)
+        if os.path.isdir(ATTACHMENTS_DIR) and os.listdir(ATTACHMENTS_DIR):
+            shutil.make_archive(os.path.join(BACKUP_DIR, f"justificatifs_{stamp}"), "zip", ATTACHMENTS_DIR)
+        _cleanup_old_backups()
+        return db_backup
+    except OSError:
+        return None
+
+
+def _cleanup_old_backups():
+    cutoff = datetime.now() - timedelta(days=BACKUP_RETENTION_DAYS)
+    for name in os.listdir(BACKUP_DIR):
+        path = os.path.join(BACKUP_DIR, name)
+        try:
+            if datetime.fromtimestamp(os.path.getmtime(path)) < cutoff:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _backup_exists_for_today():
+    if not os.path.isdir(BACKUP_DIR):
+        return False
+    today = datetime.now().strftime("%Y-%m-%d")
+    return any(name.startswith(f"caisse_{today}") for name in os.listdir(BACKUP_DIR))
+
+
+def maybe_daily_backup():
+    """Appelé au démarrage : fait une sauvegarde si aucune n'existe pour
+    aujourd'hui. Silencieux, ne doit jamais empêcher l'appli de démarrer."""
+    try:
+        if os.path.exists(DB_PATH) and not _backup_exists_for_today():
+            backup_now()
+    except OSError:
+        pass
 
 
 def upsert_jour(jour_date, solde_initial, recettes, expenses):
@@ -1694,6 +1743,8 @@ class CaisseApp(tk.Tk):
                     command=self._print_month_report).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="📊 Export CSV (comptable)",
                     command=self._export_month_csv).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="💾 Sauvegarder maintenant",
+                    command=self._backup_now).pack(side="right")
 
         today = datetime.now()
         self.cur_week_monday = today - timedelta(days=today.weekday())
@@ -1752,6 +1803,15 @@ class CaisseApp(tk.Tk):
         if ym:
             export_monthly_csv(*ym)
 
+    def _backup_now(self):
+        path = backup_now()
+        if path:
+            messagebox.showinfo("Sauvegarde effectuée",
+                                 f"Une copie de la caisse a été enregistrée dans :\n{BACKUP_DIR}")
+        else:
+            messagebox.showerror("Échec de la sauvegarde",
+                                  "La sauvegarde n'a pas pu être effectuée. Vérifie l'espace disque disponible.")
+
     def _refresh_dashboard(self):
         stats = monthly_stats(self.var_month.get().strip())
         self.txt_dash.config(state="normal")
@@ -1808,6 +1868,8 @@ if __name__ == "__main__":
     authorized = auth_dlg.result
     if not authorized:
         sys.exit(0)
+
+    maybe_daily_backup()
 
     app = CaisseApp()
     app.mainloop()

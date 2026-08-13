@@ -37,28 +37,54 @@ le même dossier — c'est là que sont stockées toutes les journées enregistr
 
 ## 3. Fonctionnalités actuelles
 
-- Saisie du solde initial, des recettes du jour, et des dépenses une par une
-  (motif + catégorie + montant)
-- Catégorie dédiée **« Versement banque »** pour les dépôts en banque
+- **Connexion protégée par mot de passe** à l'ouverture (avec question de secours
+  pour réinitialiser en cas d'oubli)
+- Système **mensuel** : le solde de départ se saisit une seule fois, au premier
+  jour du mois ; ensuite il est reporté automatiquement chaque jour
+- Sélection de la date via un **calendrier** (les jours déjà saisis sont repérés)
+- Saisie des recettes du jour et des dépenses une par une (motif + catégorie + montant),
+  **modifiables** directement après coup (pas besoin de supprimer/ressaisir)
+- Catégorie dédiée **« Versement banque »** pour les dépôts en banque — comptée à
+  part des vraies dépenses (ce n'est pas une dépense, juste un déplacement d'argent),
+  mais toujours déduite du montant en caisse
 - Calcul automatique du montant final en caisse
-- Historique de toutes les journées, modifiable en double-cliquant
 - Justificatif (photo ou PDF de facture) attachable à chaque dépense, consultable
   à tout moment même si le papier d'origine est perdu — stocké dans le dossier
   `justificatifs/`
+- Historique de toutes les journées avec calendrier intégré
 - Tableau de bord mensuel : total recettes/dépenses et répartition par catégorie
-- Impression : génère une page propre et l'ouvre dans le navigateur (Ctrl+P pour
-  imprimer sur papier ou enregistrer en PDF) — fonctionne aussi hors ligne
+- **Rapports hebdomadaire et mensuel imprimables**, et **export CSV** (format Excel
+  français) pour le comptable : résumé, catégories, détail jour par jour, journal
+  complet des mouvements
+- Impression des fiches et rapports : génère une page propre et l'ouvre dans le
+  navigateur (Ctrl+P pour imprimer sur papier ou enregistrer en PDF) — fonctionne
+  aussi hors ligne
 
 ## 4. Sauvegarde
 
-Le fichier `caisse.db` contient toutes les données, et le dossier `justificatifs/`
-contient les photos/PDF de factures attachées aux dépenses. Pense à sauvegarder
-**les deux ensemble** de temps en temps (clé USB, dossier partagé de la société)
-pour ne jamais perdre l'historique ni les justificatifs.
+Une **sauvegarde automatique** de `caisse.db` (et des justificatifs) est faite une
+fois par jour, à l'ouverture de l'application, dans le dossier `sauvegardes/`
+(conservée 30 jours). Un bouton **« 💾 Sauvegarder maintenant »** dans l'onglet
+Tableau de bord permet aussi de le faire à tout moment.
 
-## 5. Prochaines évolutions possibles
+Cette sauvegarde reste néanmoins **sur le même ordinateur** : pense à copier de
+temps en temps `caisse.db`, `justificatifs/` et `sauvegardes/` sur une clé USB ou
+un dossier partagé de la société, pour être protégé même en cas de panne du disque.
+
+## 5. Mot de passe oublié
+
+Sur l'écran de connexion, clique sur **« Mot de passe oublié ? »** et réponds à la
+question de secours définie lors de la première configuration. Si la question de
+secours a aussi été oubliée, il faut qu'une personne ayant accès au fichier
+`caisse.db` supprime les lignes `password_hash`/`password_salt` de la table
+`app_config` (via un outil SQLite) pour repartir sur une configuration neuve.
+
+## 6. Prochaines évolutions possibles
 
 - Saisie vocale des dépenses
 - Reconnaissance automatique de tickets/factures (photo → montant + motif détectés)
 - Alerte automatique quand le montant en caisse dépasse un seuil
+- Verrouillage des mois clôturés + traçabilité des modifications
+- Gestion des catégories directement depuis l'application
+- Rapport annuel imprimable
 - Accès partagé entre plusieurs postes du magasin (mode réseau local)
