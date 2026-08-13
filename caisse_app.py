@@ -446,6 +446,25 @@ def monthly_stats(year_month):
     return month_stats_full(y, m)
 
 
+def year_stats_full(year):
+    return _period_stats(f"{year:04d}-01-01", f"{year:04d}-12-31")
+
+
+def _group_days_by_month(days):
+    """Agrège une liste de jours (issue de _period_stats) par mois, dans
+    l'ordre chronologique — utilisé pour le détail du rapport annuel."""
+    months = {}
+    for d in days:
+        ym = d["date"][:7]
+        m = months.setdefault(ym, {"recettes": 0.0, "depenses": 0.0, "versements": 0.0,
+                                     "solde_initial": d["solde_initial"], "final": None})
+        m["recettes"] += d["recettes"]
+        m["depenses"] += d["depenses"]
+        m["versements"] += d["versements"]
+        m["final"] = d["final"]
+    return months
+
+
 # ---------------------------------------------------------------------------
 # Export / impression (génère une page HTML locale, ouverte dans le navigateur)
 # ---------------------------------------------------------------------------
@@ -709,6 +728,138 @@ def export_monthly_report(year, month):
     stats = month_stats_full(year, month)
     label = f"{FR_MOIS[month - 1]} {year}"
     export_period_report_html("Mensuel", label, f"mois_{year:04d}-{month:02d}", stats)
+
+
+def export_yearly_report(year):
+    """Rapport annuel imprimable : détail mois par mois (12 lignes, plus
+    lisible à l'impression que 365 lignes journalières) + répartition par
+    catégorie sur l'année entière."""
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+    stats = year_stats_full(year)
+    months = _group_days_by_month(stats["days"])
+
+    if months:
+        month_rows = "".join(
+            f"<tr><td>{FR_MOIS[int(ym[5:7]) - 1]}</td><td class='amt'>{fmt(m['recettes'])}</td>"
+            f"<td class='amt'>{fmt(m['depenses'])}</td><td class='amt'>{fmt(m['versements'])}</td>"
+            f"<td class='amt' style='font-weight:700; color:{SUCCESS if m['final'] >= 0 else DANGER}'>{fmt(m['final'])}</td></tr>"
+            for ym, m in sorted(months.items())
+        )
+    else:
+        month_rows = "<tr><td colspan='5' class='muted' style='text-align:center'>Aucune journée enregistrée sur cette année</td></tr>"
+
+    if stats["par_categorie"]:
+        cat_rows = "".join(
+            f"<tr><td>{html.escape(cat)}</td><td class='amt'>{fmt(montant)}</td></tr>"
+            for cat, montant in sorted(stats["par_categorie"].items(), key=lambda x: -x[1])
+        )
+    else:
+        cat_rows = "<tr><td colspan='2' class='muted' style='text-align:center'>Aucune dépense</td></tr>"
+
+    solde_debut_txt = fmt(stats["solde_debut"]) if stats["solde_debut"] is not None else "—"
+    solde_fin_txt = fmt(stats["solde_fin"]) if stats["solde_fin"] is not None else "—"
+    final_class = "positive" if (stats["solde_fin"] or 0) >= 0 else "negative"
+    logo_uri = _logo_data_uri()
+    logo_html = f'<img src="{logo_uri}" alt="Les Cinq Frères" class="logo">' if logo_uri else ""
+
+    content = f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<title>Rapport annuel — {year}</title>
+<style>
+ :root {{
+   --navy:#004E74; --navy-deep:#00354F; --teal:#08A4B0; --ink:#1F2A33;
+   --muted:#5B6B79; --border:#DCE3E8; --success:#1B8A5A; --danger:#C1373B; --bg:#F4F6F8;
+ }}
+ * {{ box-sizing:border-box; }}
+ body {{ font-family:'Segoe UI', Arial, sans-serif; background:var(--bg); color:var(--ink); margin:0; padding:40px 16px; font-size:14px; }}
+ .card {{ max-width:760px; margin:0 auto; background:#fff; border:1px solid var(--border); border-radius:12px;
+          box-shadow:0 6px 20px rgba(0,78,116,0.10); overflow:hidden; }}
+ .head {{ background:var(--navy-deep); color:#fff; padding:26px 48px; text-align:center; }}
+ .logo {{ height:52px; margin-bottom:10px; }}
+ .head h1 {{ margin:0; font-size:17px; letter-spacing:0.5px; }}
+ .head p {{ margin:5px 0 0; font-size:12px; color:var(--teal); font-weight:600; text-transform:uppercase; letter-spacing:1px; }}
+ .body {{ padding:0 48px 36px; }}
+ .period-row {{ display:flex; justify-content:space-between; align-items:baseline;
+                 padding:20px 0 16px; border-bottom:2px solid var(--navy); margin-bottom:20px; }}
+ .period-row .label {{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }}
+ .period-row .value {{ font-size:18px; font-weight:700; color:var(--navy); }}
+ .period-row .gen {{ font-size:11px; color:var(--muted); text-align:right; }}
+ h2.section {{ font-size:12px; text-transform:uppercase; letter-spacing:0.5px; color:var(--muted);
+               margin:22px 0 8px; }}
+ table {{ width:100%; border-collapse:collapse; }}
+ .tbl {{ font-size:13px; border:1px solid var(--border); }}
+ .tbl th {{ background:var(--bg); color:var(--muted); font-size:10.5px; text-transform:uppercase;
+            letter-spacing:0.5px; text-align:left; padding:7px 9px; border-bottom:1px solid var(--border); }}
+ .tbl th.amt {{ text-align:right; }}
+ .tbl td {{ padding:7px 9px; border-bottom:1px solid var(--border); }}
+ .tbl tr:last-child td {{ border-bottom:none; }}
+ .muted {{ color:var(--muted); }}
+ .amt {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }}
+ .totals {{ margin-top:6px; font-size:14px; }}
+ .totals td {{ padding:6px 0; }}
+ .totals tr.final td {{ padding-top:12px; border-top:2px solid var(--navy); font-weight:700; font-size:18px; }}
+ .totals tr.final.positive td {{ color:var(--success); }}
+ .totals tr.final.negative td {{ color:var(--danger); }}
+ .signatures {{ display:flex; gap:32px; margin-top:44px; }}
+ .sig-box {{ flex:1; text-align:center; }}
+ .sig-line {{ height:36px; border-bottom:1px solid var(--ink); }}
+ .sig-box span {{ display:block; margin-top:8px; font-size:11px; color:var(--muted); }}
+ .foot {{ text-align:center; padding:0 48px 26px; }}
+ button {{ background:var(--navy); color:#fff; border:none; border-radius:8px; padding:12px 28px;
+           font-size:14px; font-weight:600; cursor:pointer; }}
+ button:hover {{ background:var(--navy-deep); }}
+ @media print {{ body {{ background:#fff; padding:0; }} .card {{ box-shadow:none; border:none; max-width:100%; }} .foot {{ display:none; }} }}
+</style></head>
+<body>
+<div class="card">
+  <div class="head">
+    {logo_html}
+    <h1>SOCIÉTÉ MAGASIN LES CINQ FRÈRES</h1>
+    <p>Rapport annuel</p>
+  </div>
+  <div class="body">
+    <div class="period-row">
+      <div><div class="label">Année</div><div class="value">{year}</div></div>
+      <div class="gen">Généré le<br>{datetime.now().strftime('%d/%m/%Y à %H:%M')}</div>
+    </div>
+
+    <h2 class="section">Détail par mois</h2>
+    <table class="tbl">
+      <thead><tr><th>Mois</th><th class="amt">Recettes</th><th class="amt">Dépenses</th>
+        <th class="amt">Versements</th><th class="amt">Solde fin de mois</th></tr></thead>
+      <tbody>{month_rows}</tbody>
+    </table>
+
+    <h2 class="section">Dépenses par catégorie (année entière)</h2>
+    <table class="tbl">
+      <thead><tr><th>Catégorie</th><th class="amt">Montant</th></tr></thead>
+      <tbody>{cat_rows}</tbody>
+    </table>
+
+    <table class="totals">
+     <tr><td>Solde en début d'année</td><td class="amt">{solde_debut_txt}</td></tr>
+     <tr><td>Total recettes</td><td class="amt">+ {fmt(stats['total_recettes'])}</td></tr>
+     <tr><td>Total dépenses</td><td class="amt">- {fmt(stats['total_depenses'])}</td></tr>
+     {"<tr><td>Total versements banque</td><td class='amt'>- " + fmt(stats['total_versements']) + "</td></tr>" if stats['total_versements'] else ""}
+     <tr class="final {final_class}"><td>SOLDE EN FIN D'ANNÉE</td><td class="amt">{solde_fin_txt}</td></tr>
+    </table>
+
+    <div class="signatures">
+      <div class="sig-box"><div class="sig-line"></div><span>Signature responsable</span></div>
+      <div class="sig-box"><div class="sig-line"></div><span>Signature comptable</span></div>
+    </div>
+  </div>
+  <div class="foot"><button onclick="window.print()">🖨 Imprimer</button></div>
+</div>
+</body></html>"""
+    path = os.path.join(EXPORTS_DIR, f"rapport_annee_{year}.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    webbrowser.open(f"file://{path}")
+
+
+def export_yearly_csv(year):
+    export_csv_report(str(year), f"annee_{year}", year_stats_full(year))
 
 
 def _num_fr(value):
@@ -2006,6 +2157,20 @@ class CaisseApp(tk.Tk):
         ttk.Button(week_bar, text="📊 Export CSV (comptable)",
                     command=self._export_week_csv).pack(side="left", padx=(8, 0))
 
+        self.cur_year = datetime.now().year
+        year_bar = ttk.Frame(f, style="Paper.TFrame")
+        year_bar.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Label(year_bar, text="Année", style="Cat.TLabel").pack(side="left", padx=(0, 8))
+        ttk.Button(year_bar, text="◀", width=3, command=lambda: self._change_year(-1)).pack(side="left")
+        self.lbl_year = ttk.Label(year_bar, text="", font=("Segoe UI", 10, "bold"))
+        self.lbl_year.pack(side="left", padx=8)
+        ttk.Button(year_bar, text="▶", width=3, command=lambda: self._change_year(1)).pack(side="left")
+        ttk.Button(year_bar, text="🖨 Rapport annuel", style="Accent.TButton",
+                    command=self._print_year_report).pack(side="left", padx=(12, 0))
+        ttk.Button(year_bar, text="📊 Export CSV (comptable)",
+                    command=self._export_year_csv).pack(side="left", padx=(8, 0))
+        self._refresh_year_label()
+
         self.txt_dash = tk.Text(f, font=("Consolas", 11), bg=SURFACE, fg=INK, relief="flat",
                                  height=26, wrap="word", highlightthickness=0, borderwidth=0)
         self.txt_dash.tag_configure("title", foreground=NAVY, font=("Consolas", 12, "bold"))
@@ -2030,6 +2195,19 @@ class CaisseApp(tk.Tk):
 
     def _export_week_csv(self):
         export_weekly_csv(self.cur_week_monday.strftime("%Y-%m-%d"))
+
+    def _change_year(self, delta):
+        self.cur_year += delta
+        self._refresh_year_label()
+
+    def _refresh_year_label(self):
+        self.lbl_year.config(text=str(self.cur_year))
+
+    def _print_year_report(self):
+        export_yearly_report(self.cur_year)
+
+    def _export_year_csv(self):
+        export_yearly_csv(self.cur_year)
 
     def _parse_month_field(self):
         year_month = self.var_month.get().strip()

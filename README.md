@@ -53,9 +53,12 @@ le même dossier — c'est là que sont stockées toutes les journées enregistr
   `justificatifs/`
 - Historique de toutes les journées avec calendrier intégré
 - Tableau de bord mensuel : total recettes/dépenses et répartition par catégorie
-- **Rapports hebdomadaire et mensuel imprimables**, et **export CSV** (format Excel
-  français) pour le comptable : résumé, catégories, détail jour par jour, journal
-  complet des mouvements
+- **Rapports hebdomadaire, mensuel et annuel imprimables**, et **export CSV** (format
+  Excel français) pour le comptable : résumé, catégories, détail jour par jour (ou
+  mois par mois pour l'année), journal complet des mouvements
+- Verrouillage automatique des jours passés (modification protégée par mot de passe)
+  avec journal des modifications (qui a changé quoi, et quand)
+- Gestion des catégories de dépenses directement depuis l'application
 - Impression des fiches et rapports : génère une page propre et l'ouvre dans le
   navigateur (Ctrl+P pour imprimer sur papier ou enregistrer en PDF) — fonctionne
   aussi hors ligne
@@ -84,7 +87,4 @@ secours a aussi été oubliée, il faut qu'une personne ayant accès au fichier
 - Saisie vocale des dépenses
 - Reconnaissance automatique de tickets/factures (photo → montant + motif détectés)
 - Alerte automatique quand le montant en caisse dépasse un seuil
-- Verrouillage des mois clôturés + traçabilité des modifications
-- Gestion des catégories directement depuis l'application
-- Rapport annuel imprimable
 - Accès partagé entre plusieurs postes du magasin (mode réseau local)
