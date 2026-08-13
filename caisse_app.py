@@ -13,6 +13,7 @@ import os
 import csv
 import hashlib
 import json
+import platform
 import shutil
 import sqlite3
 import sys
@@ -139,6 +140,45 @@ def set_config(key, value):
               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Verrou "poste actif" — quand caisse.db est partagé via un dossier cloud
+# (OneDrive/Google Drive) entre plusieurs ordinateurs, avertit si un AUTRE
+# poste a utilisé l'application très récemment, pour éviter que deux
+# personnes n'écrasent leurs saisies l'une de l'autre. Stocké dans la table
+# app_config déjà existante (aucune migration de schéma nécessaire).
+# ---------------------------------------------------------------------------
+LOCK_MAX_AGE_SECONDS = 300
+
+
+def machine_name():
+    return os.environ.get("COMPUTERNAME") or platform.node() or "Poste inconnu"
+
+
+def check_active_lock(current_machine, max_age_seconds=LOCK_MAX_AGE_SECONDS):
+    lock_machine = get_config("lock_machine")
+    lock_heartbeat = get_config("lock_heartbeat_at")
+    if not lock_machine or lock_machine == current_machine or not lock_heartbeat:
+        return None
+    try:
+        last = datetime.strptime(lock_heartbeat, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    if (datetime.now() - last).total_seconds() > max_age_seconds:
+        return None
+    return {"machine": lock_machine, "heartbeat_at": lock_heartbeat}
+
+
+def touch_lock(current_machine):
+    set_config("lock_machine", current_machine)
+    set_config("lock_heartbeat_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def release_lock(current_machine):
+    if get_config("lock_machine") == current_machine:
+        set_config("lock_machine", "")
+        set_config("lock_heartbeat_at", "")
 
 
 def get_categories():
@@ -1276,15 +1316,64 @@ class LoginDialog(tk.Tk):
         self.destroy()
 
 
+class LockWarningDialog(tk.Tk):
+    """Affichée avant l'ouverture de la caisse si un autre poste (partage
+    cloud type OneDrive) l'a utilisée très récemment, pour éviter d'écraser
+    ses saisies en travaillant en même temps sur le même jour."""
+
+    def __init__(self, lock_info):
+        super().__init__()
+        self.result = False
+        self.title("Attention — Livre de Caisse")
+        self.configure(bg=SURFACE)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        _auth_style(self)
+
+        card = tk.Frame(self, bg=SURFACE, padx=28, pady=24)
+        card.pack()
+        tk.Label(card, text="⚠️ Caisse peut-être en cours d'utilisation", bg=SURFACE, fg=DANGER,
+                  font=("Segoe UI", 12, "bold"), wraplength=360, justify="left").pack(anchor="w")
+
+        msg = (f"Le poste « {lock_info['machine']} » a utilisé cette caisse à "
+               f"{lock_info['heartbeat_at']} (il y a moins de 5 minutes).\n\n"
+               "Si cette personne a encore l'application ouverte en ce moment et que "
+               "vous enregistrez chacun une journée en même temps, l'un de vous risque "
+               "d'effacer les saisies de l'autre.\n\n"
+               "Vérifie avec elle avant de continuer, ou attends quelques minutes.")
+        tk.Label(card, text=msg, bg=SURFACE, fg=INK, font=("Segoe UI", 9),
+                  wraplength=360, justify="left").pack(anchor="w", pady=(10, 0))
+
+        btns = tk.Frame(card, bg=SURFACE)
+        btns.pack(anchor="w", pady=(18, 0))
+        ttk.Button(btns, text="Continuer quand même", style="Primary.TButton",
+                    command=self._on_continue).pack(side="left")
+        tk.Button(btns, text="Quitter", command=self._on_cancel,
+                   bg=SURFACE, fg=MUTED, relief="flat", font=("Segoe UI", 9, "underline"),
+                   cursor="hand2").pack(side="left", padx=(14, 0))
+
+        _auth_center(self)
+
+    def _on_continue(self):
+        self.result = True
+        self.destroy()
+
+    def _on_cancel(self):
+        self.result = False
+        self.destroy()
+
+
 # ---------------------------------------------------------------------------
 # Interface graphique
 # ---------------------------------------------------------------------------
 class CaisseApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, current_machine=None):
         super().__init__()
         self.title("Société Magasin Les Cinq Frères — Livre de Caisse")
         self.geometry("920x620")
         self.configure(bg=BG)
+        self.machine_name = current_machine or machine_name()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.expenses = []  # dépenses de la journée en cours de saisie
 
         self._build_style()
@@ -1307,6 +1396,18 @@ class CaisseApp(tk.Tk):
 
         self.notebook.bind("<<NotebookTabChanged>>", lambda e: self._refresh_all())
         self._new_day(datetime.now().strftime("%Y-%m-%d"))
+        self._heartbeat_loop()
+
+    def _heartbeat_loop(self):
+        # Signale que ce poste utilise la caisse en ce moment (utile quand
+        # caisse.db est partagé entre plusieurs ordinateurs via un dossier
+        # cloud) — répété toutes les 45s tant que l'application est ouverte.
+        touch_lock(self.machine_name)
+        self.after(45000, self._heartbeat_loop)
+
+    def _on_close(self):
+        release_lock(self.machine_name)
+        self.destroy()
 
     def _build_style(self):
         style = ttk.Style(self)
@@ -2342,7 +2443,19 @@ if __name__ == "__main__":
     if not authorized:
         sys.exit(0)
 
+    # Si caisse.db est partagé via un dossier cloud (OneDrive/Google Drive)
+    # entre plusieurs postes, avertit si un autre poste l'a utilisée il y a
+    # moins de 5 minutes, pour éviter que deux personnes n'écrasent leurs
+    # saisies en travaillant en même temps sur le même jour.
+    current_machine = machine_name()
+    lock_info = check_active_lock(current_machine)
+    if lock_info:
+        warn_dlg = LockWarningDialog(lock_info)
+        warn_dlg.mainloop()
+        if not warn_dlg.result:
+            sys.exit(0)
+
     maybe_daily_backup()
 
-    app = CaisseApp()
+    app = CaisseApp(current_machine)
     app.mainloop()
