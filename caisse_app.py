@@ -18,7 +18,7 @@ import sys
 import uuid
 import calendar as calendar_mod
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from datetime import date, datetime, timedelta
 import webbrowser
 import html
@@ -102,6 +102,12 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS app_config (
         key TEXT PRIMARY KEY,
         value TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        horodatage TEXT NOT NULL,
+        jour_date TEXT NOT NULL,
+        description TEXT NOT NULL
     )""")
     conn.commit()
     conn.close()
@@ -225,6 +231,27 @@ def maybe_daily_backup():
             backup_now()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Journal des modifications a posteriori (jours passés déverrouillés)
+# ---------------------------------------------------------------------------
+def log_audit(jour_date, description):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO audit_log (horodatage, jour_date, description) VALUES (?, ?, ?)",
+              (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), jour_date, description))
+    conn.commit()
+    conn.close()
+
+
+def list_audit_log(limit=300):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT horodatage, jour_date, description FROM audit_log ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    return [{"horodatage": r[0], "jour_date": r[1], "description": r[2]} for r in rows]
 
 
 def upsert_jour(jour_date, solde_initial, recettes, expenses):
@@ -1211,26 +1238,39 @@ class CaisseApp(tk.Tk):
 
         ttk.Label(top, text="Recettes du jour", style="Cat.TLabel").grid(row=0, column=2, sticky="w")
         self.var_recettes = tk.StringVar(value="0")
-        ttk.Entry(top, textvariable=self.var_recettes, width=14).grid(row=1, column=2, sticky="w")
+        self.e_recettes = ttk.Entry(top, textvariable=self.var_recettes, width=14)
+        self.e_recettes.grid(row=1, column=2, sticky="w")
         self.var_recettes.trace_add("write", lambda *a: self._refresh_summary())
         self.var_solde.trace_add("write", lambda *a: self._refresh_summary())
 
+        # Bandeau de verrouillage (jours passés)
+        self.lock_bar = tk.Frame(f, bg="#FBEFD9")
+        self.lbl_lock = tk.Label(self.lock_bar, text="🔒 Journée déjà passée — verrouillée pour éviter les modifications accidentelles.",
+                                   bg="#FBEFD9", fg="#7A5A1E", font=("Segoe UI", 9, "bold"), padx=14, pady=8)
+        self.lbl_lock.pack(side="left")
+        ttk.Button(self.lock_bar, text="🔓 Déverrouiller pour corriger",
+                    command=self._unlock_day).pack(side="right", padx=14, pady=6)
+        # (empaqueté/masqué dynamiquement par _apply_lock_state)
+
         # Ajout dépense
-        add_frame = ttk.Frame(f, style="Paper.TFrame")
+        self.add_frame = add_frame = ttk.Frame(f, style="Paper.TFrame")
         add_frame.pack(fill="x", padx=16, pady=8)
         ttk.Label(add_frame, text="Motif", style="Cat.TLabel").grid(row=0, column=0, sticky="w")
         self.var_motif = tk.StringVar()
-        ttk.Entry(add_frame, textvariable=self.var_motif, width=28).grid(row=1, column=0, padx=(0, 10))
+        self.e_motif = ttk.Entry(add_frame, textvariable=self.var_motif, width=28)
+        self.e_motif.grid(row=1, column=0, padx=(0, 10))
 
         ttk.Label(add_frame, text="Catégorie", style="Cat.TLabel").grid(row=0, column=1, sticky="w")
         self.var_cat = tk.StringVar(value=CATEGORIES[0])
-        ttk.Combobox(add_frame, textvariable=self.var_cat, values=CATEGORIES, width=22, state="readonly").grid(row=1, column=1, padx=(0, 10))
+        self.cb_categorie = ttk.Combobox(add_frame, textvariable=self.var_cat, values=CATEGORIES, width=22, state="readonly")
+        self.cb_categorie.grid(row=1, column=1, padx=(0, 10))
 
         ttk.Label(add_frame, text="Montant", style="Cat.TLabel").grid(row=0, column=2, sticky="w")
         self.var_montant = tk.StringVar()
         e_montant = ttk.Entry(add_frame, textvariable=self.var_montant, width=12)
         e_montant.grid(row=1, column=2, padx=(0, 10))
         e_montant.bind("<Return>", lambda e: self.btn_add_expense.invoke())
+        self.e_montant = e_montant
 
         self._editing_idx = None
         self.btn_add_expense = ttk.Button(add_frame, text="+ Ajouter", style="Primary.TButton",
@@ -1244,7 +1284,8 @@ class CaisseApp(tk.Tk):
         attach_box = ttk.Frame(add_frame, style="Paper.TFrame")
         attach_box.grid(row=1, column=5, sticky="w")
         self._pending_attachment = None
-        ttk.Button(attach_box, text="📎 Joindre", command=self._pick_attachment).pack(side="left")
+        self.btn_attach = ttk.Button(attach_box, text="📎 Joindre", command=self._pick_attachment)
+        self.btn_attach.pack(side="left")
         self.lbl_attachment = tk.Label(attach_box, text="aucun fichier", bg=BG, fg=MUTED,
                                         font=("Segoe UI", 8, "italic"))
         self.lbl_attachment.pack(side="left", padx=(8, 0))
@@ -1285,10 +1326,12 @@ class CaisseApp(tk.Tk):
 
         row_actions = ttk.Frame(f, style="Paper.TFrame")
         row_actions.pack(fill="x", padx=16)
-        ttk.Button(row_actions, text="✏️ Modifier la dépense sélectionnée",
-                    command=self._edit_selected_expense).pack(side="left", padx=(0, 10))
-        ttk.Button(row_actions, text="Supprimer la dépense sélectionnée",
-                    command=self._remove_selected_expense).pack(side="left")
+        self.btn_edit_selected = ttk.Button(row_actions, text="✏️ Modifier la dépense sélectionnée",
+                                              command=self._edit_selected_expense)
+        self.btn_edit_selected.pack(side="left", padx=(0, 10))
+        self.btn_remove_selected = ttk.Button(row_actions, text="Supprimer la dépense sélectionnée",
+                                                command=self._remove_selected_expense)
+        self.btn_remove_selected.pack(side="left")
 
         # Résumé
         summary = tk.Frame(f, bg=NAVY_DEEP)
@@ -1304,8 +1347,9 @@ class CaisseApp(tk.Tk):
 
         actions = ttk.Frame(f, style="Paper.TFrame")
         actions.pack(fill="x", padx=16, pady=(0, 16))
-        ttk.Button(actions, text="💾 Enregistrer la journée", style="Primary.TButton",
-                    command=self._save_day).pack(side="left", padx=(0, 10))
+        self.btn_save_day = ttk.Button(actions, text="💾 Enregistrer la journée", style="Primary.TButton",
+                                         command=self._save_day)
+        self.btn_save_day.pack(side="left", padx=(0, 10))
         ttk.Button(actions, text="🖨 Imprimer / Exporter", style="Accent.TButton",
                     command=self._print_current).pack(side="left")
 
@@ -1379,7 +1423,62 @@ class CaisseApp(tk.Tk):
         self._refresh_expense_list()
         self._refresh_summary()
 
+        # Une journée déjà passée est verrouillée par défaut (protection contre
+        # les modifications accidentelles a posteriori) ; aujourd'hui reste
+        # toujours librement modifiable.
+        self._is_locked_day = jour_date != datetime.now().strftime("%Y-%m-%d")
+        self._day_unlocked = False
+        self._apply_lock_state()
+
+    def _apply_lock_state(self):
+        locked = self._is_locked_day and not self._day_unlocked
+        if locked:
+            self.lock_bar.pack(fill="x", padx=16, pady=(0, 8), before=self.add_frame)
+        else:
+            self.lock_bar.pack_forget()
+
+        state = "disabled" if locked else "normal"
+        combo_state = "disabled" if locked else "readonly"
+        self.e_recettes.configure(state=state)
+        self.e_motif.configure(state=state)
+        self.e_montant.configure(state=state)
+        self.cb_categorie.configure(state=combo_state)
+        self.btn_attach.configure(state=state)
+        self.btn_add_expense.configure(state=state)
+        self.btn_edit_selected.configure(state=state)
+        self.btn_remove_selected.configure(state=state)
+        self.btn_save_day.configure(state=state)
+        # Le solde initial garde sa propre règle (lecture seule hors début de
+        # mois) : on ne le réactive jamais ici s'il était déjà readonly.
+        if locked:
+            self.e_solde.configure(state="disabled")
+        else:
+            self._new_day_solde_state_refresh()
+
+    def _new_day_solde_state_refresh(self):
+        """Réapplique l'état normal/lecture-seule du solde initial (logique
+        de début de mois) après un déverrouillage."""
+        prev = last_day_before(self.var_date.get())
+        is_month_start = prev is None or prev["date"][:7] != self.var_date.get()[:7]
+        self.e_solde.configure(state="normal" if is_month_start else "readonly")
+
+    def _unlock_day(self):
+        pw = simpledialog.askstring("Confirmation requise",
+                                     "Mot de passe de l'application :", show="•", parent=self)
+        if pw is None:
+            return
+        if not check_password(pw):
+            messagebox.showerror("Mot de passe incorrect", "Impossible de déverrouiller cette journée.")
+            return
+        self._day_unlocked = True
+        self._apply_lock_state()
+
+    def _locked(self):
+        return getattr(self, "_is_locked_day", False) and not getattr(self, "_day_unlocked", False)
+
     def _pick_attachment(self):
+        if self._locked():
+            return
         path = filedialog.askopenfilename(title="Choisir un justificatif (photo ou PDF)",
                                            filetypes=ATTACHMENT_FILETYPES)
         if not path:
@@ -1388,6 +1487,8 @@ class CaisseApp(tk.Tk):
         self.lbl_attachment.config(text=f"✓ {os.path.basename(path)}", fg=SUCCESS)
 
     def _add_expense(self):
+        if self._locked():
+            return
         motif = self.var_motif.get().strip()
         try:
             montant = float(self.var_montant.get().replace(",", "."))
@@ -1411,6 +1512,8 @@ class CaisseApp(tk.Tk):
         self.dep_canvas.focus_set()
 
     def _remove_selected_expense(self):
+        if self._locked():
+            return
         idx = self.selected_expense_idx
         if idx is None or idx >= len(self.expenses):
             return
@@ -1429,6 +1532,8 @@ class CaisseApp(tk.Tk):
         self._enter_edit_mode(idx)
 
     def _enter_edit_mode(self, idx):
+        if self._locked():
+            return
         e = self.expenses[idx]
         self._editing_idx = idx
         self.var_motif.set(e["motif"])
@@ -1562,6 +1667,8 @@ class CaisseApp(tk.Tk):
         self.txt_summary.configure(state="disabled")
 
     def _save_day(self):
+        if self._locked():
+            return
         jour_date = self.var_date.get().strip()
         try:
             datetime.strptime(jour_date, "%Y-%m-%d")
@@ -1570,6 +1677,8 @@ class CaisseApp(tk.Tk):
             return
         solde, recettes, _, _, _ = self._totals()
         upsert_jour(jour_date, solde, recettes, self.expenses)
+        if jour_date != datetime.now().strftime("%Y-%m-%d"):
+            log_audit(jour_date, "Journée modifiée a posteriori (après déverrouillage)")
         messagebox.showinfo("Enregistré", f"Journée du {jour_date} enregistrée.")
         self._refresh_all()
 
@@ -1745,6 +1854,8 @@ class CaisseApp(tk.Tk):
                     command=self._export_month_csv).pack(side="left", padx=(8, 0))
         ttk.Button(top, text="💾 Sauvegarder maintenant",
                     command=self._backup_now).pack(side="right")
+        ttk.Button(top, text="🕘 Journal des modifications",
+                    command=self._show_audit_log).pack(side="right", padx=(0, 8))
 
         today = datetime.now()
         self.cur_week_monday = today - timedelta(days=today.weekday())
@@ -1811,6 +1922,55 @@ class CaisseApp(tk.Tk):
         else:
             messagebox.showerror("Échec de la sauvegarde",
                                   "La sauvegarde n'a pas pu être effectuée. Vérifie l'espace disque disponible.")
+
+    def _show_audit_log(self):
+        # Fenêtre sans bordure système, comme le calendrier : c'est la seule
+        # formule qui s'affiche de façon fiable sur cet ordinateur (les
+        # fenêtres Toplevel décorées classiques restent parfois blanches).
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.configure(bg=BORDER)
+
+        card = tk.Frame(win, bg=SURFACE)
+        card.pack(padx=1, pady=1)
+
+        header = tk.Frame(card, bg=NAVY_DEEP)
+        header.pack(fill="x")
+        tk.Label(header, text="Journal des modifications", bg=NAVY_DEEP, fg="white",
+                  font=("Segoe UI", 11, "bold"), padx=14, pady=10).pack(side="left")
+        close_lbl = tk.Label(header, text="✕", bg=NAVY_DEEP, fg="#A9C2CF", font=("Segoe UI", 10, "bold"),
+                               padx=12, pady=10, cursor="hand2")
+        close_lbl.pack(side="right")
+        close_lbl.bind("<Button-1>", lambda e: win.destroy())
+
+        tk.Label(card, text="Journées déjà passées qui ont été déverrouillées puis modifiées.",
+                  bg=SURFACE, fg=MUTED, font=("Segoe UI", 9), anchor="w", padx=16).pack(fill="x", pady=(10, 6))
+
+        entries = list_audit_log()
+        txt = tk.Text(card, bg=SURFACE, fg=INK, font=("Consolas", 10), relief="flat",
+                       highlightthickness=0, borderwidth=0, padx=16, wrap="word", width=62, height=18)
+        txt.tag_configure("date", foreground=NAVY, font=("Consolas", 10, "bold"))
+        txt.tag_configure("muted", foreground=MUTED)
+        if entries:
+            for entry in entries:
+                txt.insert("end", f"{entry['horodatage']}  ", "date")
+                txt.insert("end", f"— journée du {entry['jour_date']}\n", "muted")
+                txt.insert("end", f"    {entry['description']}\n\n")
+        else:
+            txt.insert("end", "Aucune modification a posteriori enregistrée pour l'instant.", "muted")
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True, padx=0, pady=(0, 14))
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.transient(self)
+        win.update_idletasks()
+        w, h = win.winfo_width(), win.winfo_height()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+        win.lift()
+        win.attributes("-topmost", True)
+        win.after(300, lambda: win.attributes("-topmost", False))
+        win.focus_force()
 
     def _refresh_dashboard(self):
         stats = monthly_stats(self.var_month.get().strip())
