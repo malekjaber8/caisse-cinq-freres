@@ -74,6 +74,17 @@ def fmt(n):
         return "0.000 DT"
 
 
+def parse_amount(text):
+    """Convertit un texte saisi dans un champ montant en nombre, en tolérant
+    les espaces (normaux ou insécables) utilisées comme séparateur de
+    milliers - comme dans l'affichage de fmt() ci-dessus, ex: '1 550.000' -
+    et la virgule comme séparateur décimal. Lève ValueError si le texte,
+    une fois nettoyé, n'est toujours pas un nombre valide."""
+    cleaned = text.strip().replace("\xa0", "").replace(" ", "").replace(" ", "")
+    cleaned = cleaned.replace(",", ".")
+    return float(cleaned)
+
+
 # ---------------------------------------------------------------------------
 # Base de données
 # ---------------------------------------------------------------------------
@@ -1773,7 +1784,7 @@ class CaisseApp(tk.Tk):
             return
         motif = self.var_motif.get().strip()
         try:
-            montant = float(self.var_montant.get().replace(",", "."))
+            montant = parse_amount(self.var_montant.get())
         except ValueError:
             montant = 0
         if not motif or montant <= 0:
@@ -1948,7 +1959,7 @@ class CaisseApp(tk.Tk):
     def _save_expense_edit(self):
         motif = self.var_motif.get().strip()
         try:
-            montant = float(self.var_montant.get().replace(",", "."))
+            montant = parse_amount(self.var_montant.get())
         except ValueError:
             montant = 0
         if not motif or montant <= 0:
@@ -2022,11 +2033,11 @@ class CaisseApp(tk.Tk):
 
     def _totals(self):
         try:
-            solde = float(self.var_solde.get().replace(",", "."))
+            solde = parse_amount(self.var_solde.get())
         except ValueError:
             solde = 0
         try:
-            recettes = float(self.var_recettes.get().replace(",", "."))
+            recettes = parse_amount(self.var_recettes.get())
         except ValueError:
             recettes = 0
         # Le versement banque n'est pas une vraie dépense (l'argent n'est pas
@@ -2061,6 +2072,20 @@ class CaisseApp(tk.Tk):
             datetime.strptime(jour_date, "%Y-%m-%d")
         except ValueError:
             messagebox.showerror("Date invalide", "Utilisez le format AAAA-MM-JJ.")
+            return
+        try:
+            parse_amount(self.var_recettes.get())
+        except ValueError:
+            messagebox.showerror("Recette invalide",
+                                  f"Le montant de recette saisi (« {self.var_recettes.get()} ») "
+                                  "n'est pas reconnu comme un nombre.\nCorrige-le avant d'enregistrer.")
+            return
+        try:
+            parse_amount(self.var_solde.get())
+        except ValueError:
+            messagebox.showerror("Solde invalide",
+                                  f"Le solde de départ saisi (« {self.var_solde.get()} ») "
+                                  "n'est pas reconnu comme un nombre.\nCorrige-le avant d'enregistrer.")
             return
         solde, recettes, _, _, _ = self._totals()
         upsert_jour(jour_date, solde, recettes, self.expenses)
