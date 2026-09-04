@@ -1101,6 +1101,33 @@ def render_month_calendar(container, year, month, *, selected_date=None, marked_
         today_lbl.bind("<Button-1>", lambda e: on_today())
 
 
+def _is_descendant(widget, ancestor):
+    w = widget
+    while w is not None:
+        if w == ancestor:
+            return True
+        w = w.master
+    return False
+
+
+def _bind_dismiss_on_focus_out(win):
+    """Ferme automatiquement une fenêtre flottante sans bordure dès que le
+    focus clavier passe à un widget qui n'en fait pas partie (ex: clic sur
+    un champ de l'application principale). Sans ça, sur cet ordinateur, ce
+    type de fenêtre peut rester ouverte de façon invisible et continuer à
+    intercepter le clavier, bloquant la saisie ailleurs dans l'application."""
+    def _check():
+        if not win.winfo_exists():
+            return
+        try:
+            focused = win.focus_get()
+        except Exception:
+            focused = None
+        if not (focused is not None and _is_descendant(focused, win)):
+            win.destroy()
+    win.bind("<FocusOut>", lambda e: win.after(50, _check))
+
+
 class CalendarPopup(tk.Toplevel):
     def __init__(self, parent, initial_date, on_pick):
         super().__init__(parent)
@@ -1131,6 +1158,7 @@ class CalendarPopup(tk.Toplevel):
             self.focus_force()
         except tk.TclError:
             pass
+        _bind_dismiss_on_focus_out(self)
 
     def _build(self):
         render_month_calendar(
@@ -1997,6 +2025,7 @@ class CaisseApp(tk.Tk):
         win.attributes("-topmost", True)
         win.after(300, lambda: win.attributes("-topmost", False))
         win.focus_force()
+        _bind_dismiss_on_focus_out(win)
 
     def _sync_categories(self):
         """Reflète la liste de catégories à jour dans le formulaire de saisie."""
@@ -2473,6 +2502,7 @@ class CaisseApp(tk.Tk):
         win.attributes("-topmost", True)
         win.after(300, lambda: win.attributes("-topmost", False))
         win.focus_force()
+        _bind_dismiss_on_focus_out(win)
 
     def _search_motif(self):
         query = self.var_motif_search.get().strip()
@@ -2540,6 +2570,7 @@ class CaisseApp(tk.Tk):
         win.attributes("-topmost", True)
         win.after(300, lambda: win.attributes("-topmost", False))
         win.focus_force()
+        _bind_dismiss_on_focus_out(win)
 
     def _refresh_dashboard(self):
         stats = monthly_stats(self.var_month.get().strip())
