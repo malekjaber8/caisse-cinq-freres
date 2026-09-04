@@ -461,10 +461,11 @@ def _period_stats(start_date, end_date):
                 # permet de retrouver, par exemple, tout ce qui a été noté
                 # au nom d'un employé donné, quelle que soit sa catégorie.
                 entry = par_motif.setdefault(motif_key, {"label": motif.strip(), "total": 0.0,
-                                                            "count": 0, "dates": []})
+                                                            "count": 0, "dates": [], "categories": set()})
                 entry["total"] += montant
                 entry["count"] += 1
                 entry["dates"].append(jour_date)
+                entry["categories"].add(cat)
             is_versement = cat == CATEGORIE_VERSEMENT
             if is_versement:
                 total_versements += montant
@@ -666,12 +667,12 @@ def export_period_report_html(period_type, period_label, filename_slug, stats):
 
     if stats.get("par_motif"):
         motif_rows = "".join(
-            f"<tr><td>{html.escape(m['label'])}</td><td class='amt'>{m['count']}</td>"
-            f"<td class='amt'>{fmt(m['total'])}</td></tr>"
+            f"<tr><td>{html.escape(', '.join(sorted(m['categories'])))}</td><td>{html.escape(m['label'])}</td>"
+            f"<td class='amt'>{m['count']}</td><td class='amt'>{fmt(m['total'])}</td></tr>"
             for m in sorted(stats["par_motif"].values(), key=lambda x: -x["total"])
         )
     else:
-        motif_rows = "<tr><td colspan='3' class='muted' style='text-align:center'>Aucun motif enregistré</td></tr>"
+        motif_rows = "<tr><td colspan='4' class='muted' style='text-align:center'>Aucun motif enregistré</td></tr>"
 
     if stats["days"]:
         day_rows = "".join(
@@ -765,7 +766,7 @@ def export_period_report_html(period_type, period_label, filename_slug, stats):
 
     <h2 class="section">Détail par motif (ex: par employé)</h2>
     <table class="tbl">
-      <thead><tr><th>Motif</th><th class="amt">Nb</th><th class="amt">Montant total</th></tr></thead>
+      <thead><tr><th>Catégorie</th><th>Motif</th><th class="amt">Nb</th><th class="amt">Montant total</th></tr></thead>
       <tbody>{motif_rows}</tbody>
     </table>
 
@@ -836,12 +837,12 @@ def export_yearly_report(year):
 
     if stats.get("par_motif"):
         motif_rows = "".join(
-            f"<tr><td>{html.escape(m['label'])}</td><td class='amt'>{m['count']}</td>"
-            f"<td class='amt'>{fmt(m['total'])}</td></tr>"
+            f"<tr><td>{html.escape(', '.join(sorted(m['categories'])))}</td><td>{html.escape(m['label'])}</td>"
+            f"<td class='amt'>{m['count']}</td><td class='amt'>{fmt(m['total'])}</td></tr>"
             for m in sorted(stats["par_motif"].values(), key=lambda x: -x["total"])
         )
     else:
-        motif_rows = "<tr><td colspan='3' class='muted' style='text-align:center'>Aucun motif enregistré</td></tr>"
+        motif_rows = "<tr><td colspan='4' class='muted' style='text-align:center'>Aucun motif enregistré</td></tr>"
 
     solde_debut_txt = fmt(stats["solde_debut"]) if stats["solde_debut"] is not None else "—"
     solde_fin_txt = fmt(stats["solde_fin"]) if stats["solde_fin"] is not None else "—"
@@ -925,7 +926,7 @@ def export_yearly_report(year):
 
     <h2 class="section">Détail par motif (ex: par employé) — année entière</h2>
     <table class="tbl">
-      <thead><tr><th>Motif</th><th class="amt">Nb</th><th class="amt">Montant total</th></tr></thead>
+      <thead><tr><th>Catégorie</th><th>Motif</th><th class="amt">Nb</th><th class="amt">Montant total</th></tr></thead>
       <tbody>{motif_rows}</tbody>
     </table>
 
@@ -985,9 +986,9 @@ def export_csv_report(period_label, filename_slug, stats):
         w.writerow([])
 
         w.writerow(["DÉTAIL PAR MOTIF (EX: PAR EMPLOYÉ)"])
-        w.writerow(["Motif", "Nombre", "Montant total"])
+        w.writerow(["Catégorie", "Motif", "Nombre", "Montant total"])
         for m in sorted(stats.get("par_motif", {}).values(), key=lambda x: -x["total"]):
-            w.writerow([m["label"], m["count"], _num_fr(m["total"])])
+            w.writerow([", ".join(sorted(m["categories"])), m["label"], m["count"], _num_fr(m["total"])])
         w.writerow([])
 
         w.writerow(["DÉTAIL JOUR PAR JOUR"])
