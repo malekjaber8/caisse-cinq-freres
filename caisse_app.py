@@ -2150,6 +2150,7 @@ class CaisseApp(tk.Tk):
 
         btns = ttk.Frame(right_col, style="Paper.TFrame")
         btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="🔄 Actualiser / Recalculer", command=self._force_refresh_historique).pack(side="left", padx=(0, 10))
         ttk.Button(btns, text="Ouvrir dans Saisie", command=self._open_selected_day).pack(side="left", padx=(0, 10))
         ttk.Button(btns, text="🖨 Imprimer ce jour", style="Accent.TButton",
                     command=self._print_selected_history).pack(side="left")
@@ -2439,6 +2440,15 @@ class CaisseApp(tk.Tk):
         self._refresh_historique()
         self._refresh_hist_calendar()
         self._refresh_dashboard()
+
+    def _force_refresh_historique(self):
+        """Reconstruit entièrement l'Historique, le calendrier et le tableau
+        de bord à partir de la base de données (jamais depuis un affichage
+        mis en mémoire) : si un chiffre affiché semblait ne pas correspondre
+        à la fiche du jour, ce bouton force un recalcul propre. Ne modifie
+        jamais les données elles-mêmes, seulement leur affichage."""
+        self._refresh_all()
+        messagebox.showinfo("Actualisé", "Les chiffres de l'historique ont été recalculés depuis la base de données.")
 
 
 if __name__ == "__main__":
