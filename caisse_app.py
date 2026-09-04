@@ -444,6 +444,7 @@ def _period_stats(start_date, end_date):
     rows = c.fetchall()
     total_recettes = total_depenses = total_versements = 0.0
     par_categorie = {}
+    par_motif = {}
     days = []
     movements = []
     for jour_id, jour_date, solde_initial, recettes in rows:
@@ -454,6 +455,16 @@ def _period_stats(start_date, end_date):
                                "montant": recettes, "piece_jointe": None})
         for cat, motif, montant, piece_jointe in c.fetchall():
             par_categorie[cat] = par_categorie.get(cat, 0) + montant
+            motif_key = (motif or "").strip().lower()
+            if motif_key:
+                # Regroupe par motif exact (insensible à la casse/espaces) :
+                # permet de retrouver, par exemple, tout ce qui a été noté
+                # au nom d'un employé donné, quelle que soit sa catégorie.
+                entry = par_motif.setdefault(motif_key, {"label": motif.strip(), "total": 0.0,
+                                                            "count": 0, "dates": []})
+                entry["total"] += montant
+                entry["count"] += 1
+                entry["dates"].append(jour_date)
             is_versement = cat == CATEGORIE_VERSEMENT
             if is_versement:
                 total_versements += montant
@@ -472,6 +483,7 @@ def _period_stats(start_date, end_date):
         "start": start_date, "end": end_date, "nb_jours": len(days),
         "total_recettes": total_recettes, "total_depenses": total_depenses,
         "total_versements": total_versements, "par_categorie": par_categorie,
+        "par_motif": par_motif,
         "days": days, "movements": movements,
         "solde_debut": days[0]["solde_initial"] if days else None,
         "solde_fin": days[-1]["final"] if days else None,
@@ -652,6 +664,15 @@ def export_period_report_html(period_type, period_label, filename_slug, stats):
     else:
         cat_rows = "<tr><td colspan='2' class='muted' style='text-align:center'>Aucune dépense</td></tr>"
 
+    if stats.get("par_motif"):
+        motif_rows = "".join(
+            f"<tr><td>{html.escape(m['label'])}</td><td class='amt'>{m['count']}</td>"
+            f"<td class='amt'>{fmt(m['total'])}</td></tr>"
+            for m in sorted(stats["par_motif"].values(), key=lambda x: -x["total"])
+        )
+    else:
+        motif_rows = "<tr><td colspan='3' class='muted' style='text-align:center'>Aucun motif enregistré</td></tr>"
+
     if stats["days"]:
         day_rows = "".join(
             f"<tr><td>{d['date']}</td><td class='amt'>{fmt(d['recettes'])}</td>"
@@ -742,6 +763,12 @@ def export_period_report_html(period_type, period_label, filename_slug, stats):
       <tbody>{cat_rows}</tbody>
     </table>
 
+    <h2 class="section">Détail par motif (ex: par employé)</h2>
+    <table class="tbl">
+      <thead><tr><th>Motif</th><th class="amt">Nb</th><th class="amt">Montant total</th></tr></thead>
+      <tbody>{motif_rows}</tbody>
+    </table>
+
     <table class="totals">
      <tr><td>Solde en début de période</td><td class="amt">{solde_debut_txt}</td></tr>
      <tr><td>Total recettes</td><td class="amt">+ {fmt(stats['total_recettes'])}</td></tr>
@@ -806,6 +833,15 @@ def export_yearly_report(year):
         )
     else:
         cat_rows = "<tr><td colspan='2' class='muted' style='text-align:center'>Aucune dépense</td></tr>"
+
+    if stats.get("par_motif"):
+        motif_rows = "".join(
+            f"<tr><td>{html.escape(m['label'])}</td><td class='amt'>{m['count']}</td>"
+            f"<td class='amt'>{fmt(m['total'])}</td></tr>"
+            for m in sorted(stats["par_motif"].values(), key=lambda x: -x["total"])
+        )
+    else:
+        motif_rows = "<tr><td colspan='3' class='muted' style='text-align:center'>Aucun motif enregistré</td></tr>"
 
     solde_debut_txt = fmt(stats["solde_debut"]) if stats["solde_debut"] is not None else "—"
     solde_fin_txt = fmt(stats["solde_fin"]) if stats["solde_fin"] is not None else "—"
@@ -887,6 +923,12 @@ def export_yearly_report(year):
       <tbody>{cat_rows}</tbody>
     </table>
 
+    <h2 class="section">Détail par motif (ex: par employé) — année entière</h2>
+    <table class="tbl">
+      <thead><tr><th>Motif</th><th class="amt">Nb</th><th class="amt">Montant total</th></tr></thead>
+      <tbody>{motif_rows}</tbody>
+    </table>
+
     <table class="totals">
      <tr><td>Solde en début d'année</td><td class="amt">{solde_debut_txt}</td></tr>
      <tr><td>Total recettes</td><td class="amt">+ {fmt(stats['total_recettes'])}</td></tr>
@@ -940,6 +982,12 @@ def export_csv_report(period_label, filename_slug, stats):
         w.writerow(["Catégorie", "Montant"])
         for cat, montant in sorted(stats["par_categorie"].items(), key=lambda x: -x[1]):
             w.writerow([cat, _num_fr(montant)])
+        w.writerow([])
+
+        w.writerow(["DÉTAIL PAR MOTIF (EX: PAR EMPLOYÉ)"])
+        w.writerow(["Motif", "Nombre", "Montant total"])
+        for m in sorted(stats.get("par_motif", {}).values(), key=lambda x: -x["total"]):
+            w.writerow([m["label"], m["count"], _num_fr(m["total"])])
         w.writerow([])
 
         w.writerow(["DÉTAIL JOUR PAR JOUR"])
@@ -2298,6 +2346,19 @@ class CaisseApp(tk.Tk):
                     command=self._export_year_csv).pack(side="left", padx=(8, 0))
         self._refresh_year_label()
 
+        search_bar = ttk.Frame(f, style="Paper.TFrame")
+        search_bar.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Label(search_bar, text="🔍 Rechercher un motif (ex: nom d'un employé)", style="Cat.TLabel").pack(side="left", padx=(0, 8))
+        self.var_motif_search = tk.StringVar()
+        e_search = ttk.Entry(search_bar, textvariable=self.var_motif_search, width=22)
+        e_search.pack(side="left")
+        e_search.bind("<Return>", lambda ev: self._search_motif())
+        self.var_motif_all = tk.BooleanVar(value=False)
+        ttk.Checkbutton(search_bar, text="Tout l'historique (sinon: mois ci-dessus)",
+                         variable=self.var_motif_all).pack(side="left", padx=(10, 0))
+        ttk.Button(search_bar, text="Rechercher", style="Primary.TButton",
+                    command=self._search_motif).pack(side="left", padx=(10, 0))
+
         self.txt_dash = tk.Text(f, font=("Consolas", 11), bg=SURFACE, fg=INK, relief="flat",
                                  height=26, wrap="word", highlightthickness=0, borderwidth=0)
         self.txt_dash.tag_configure("title", foreground=NAVY, font=("Consolas", 12, "bold"))
@@ -2398,6 +2459,73 @@ class CaisseApp(tk.Tk):
                 txt.insert("end", f"    {entry['description']}\n\n")
         else:
             txt.insert("end", "Aucune modification a posteriori enregistrée pour l'instant.", "muted")
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True, padx=0, pady=(0, 14))
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.transient(self)
+        win.update_idletasks()
+        w, h = win.winfo_width(), win.winfo_height()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+        win.lift()
+        win.attributes("-topmost", True)
+        win.after(300, lambda: win.attributes("-topmost", False))
+        win.focus_force()
+
+    def _search_motif(self):
+        query = self.var_motif_search.get().strip()
+        if not query:
+            messagebox.showwarning("Champ vide", "Tape un nom ou un mot à rechercher (ex: un nom d'employé).")
+            return
+        if self.var_motif_all.get():
+            start, end, period_label = "0000-01-01", "9999-12-31", "tout l'historique"
+        else:
+            ym = self._parse_month_field()
+            if not ym:
+                return
+            y, m = ym
+            start = f"{y:04d}-{m:02d}-01"
+            end = f"{y:04d}-{m:02d}-{calendar_mod.monthrange(y, m)[1]:02d}"
+            period_label = f"{FR_MOIS[m - 1]} {y}"
+        stats = _period_stats(start, end)
+        q = query.lower()
+        matches = [mv for mv in stats["movements"]
+                    if mv["type"] != "Recette" and q in (mv["motif"] or "").lower()]
+        self._show_motif_search_results(query, period_label, matches)
+
+    def _show_motif_search_results(self, query, period_label, matches):
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.configure(bg=BORDER)
+
+        card = tk.Frame(win, bg=SURFACE)
+        card.pack(padx=1, pady=1)
+
+        header = tk.Frame(card, bg=NAVY_DEEP)
+        header.pack(fill="x")
+        tk.Label(header, text=f"Résultats pour « {query} »", bg=NAVY_DEEP, fg="white",
+                  font=("Segoe UI", 11, "bold"), padx=14, pady=10).pack(side="left")
+        close_lbl = tk.Label(header, text="✕", bg=NAVY_DEEP, fg="#A9C2CF", font=("Segoe UI", 10, "bold"),
+                               padx=12, pady=10, cursor="hand2")
+        close_lbl.pack(side="right")
+        close_lbl.bind("<Button-1>", lambda e: win.destroy())
+
+        total = sum(-mv["montant"] for mv in matches)
+        tk.Label(card, text=f"Période : {period_label}   —   {len(matches)} résultat(s)   —   total : {fmt(total)}",
+                  bg=SURFACE, fg=MUTED, font=("Segoe UI", 9), anchor="w", padx=16).pack(fill="x", pady=(10, 6))
+
+        txt = tk.Text(card, bg=SURFACE, fg=INK, font=("Consolas", 10), relief="flat",
+                       highlightthickness=0, borderwidth=0, padx=16, wrap="word", width=62, height=18)
+        txt.tag_configure("date", foreground=NAVY, font=("Consolas", 10, "bold"))
+        txt.tag_configure("muted", foreground=MUTED)
+        if matches:
+            for mv in sorted(matches, key=lambda x: x["date"]):
+                txt.insert("end", f"{mv['date']}  ", "date")
+                txt.insert("end", f"— {mv['categorie']}\n", "muted")
+                txt.insert("end", f"    {mv['motif']} : {fmt(-mv['montant'])}\n\n")
+        else:
+            txt.insert("end", "Aucun résultat pour cette recherche sur cette période.", "muted")
         txt.configure(state="disabled")
         txt.pack(fill="both", expand=True, padx=0, pady=(0, 14))
 
